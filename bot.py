@@ -1,12 +1,7 @@
 """
 Obyektivka (ma'lumotnoma) Telegram boti.
-Savollarni birin-ketin so'raydi va oxirida tayyor Word (.docx) fayl yuboradi.
-
-Ishga tushirish:
-    pip install -r requirements.txt
-    export BOT_TOKEN="BotFather bergan token"
-    export ADMIN_ID="123456789"      # (ixtiyoriy) tayyor fayllar nusxasi sizga ham keladi
-    python bot.py
+Savollarni birin-ketin so'raydi, oxirida hammasini ko'rsatib, tahrirlash imkonini beradi
+va tayyor Word (.docx) fayl yuboradi.
 """
 import logging
 import os
@@ -26,25 +21,25 @@ from docgen import build_docx
 
 logging.basicConfig(level=logging.INFO)
 
-# (kalit, savol) — shu tartibda so'raladi
+# (kalit, qisqa nom, savol)
 PERSONAL = [
-    ("fio", "Familiyangiz, ismingiz va otangizning ismini yozing.\nMasalan: Nursoatova Feruza Muxiddin qizi"),
-    ("birth_date", "Tug‘ilgan sanangiz (kun.oy.yil)?\nMasalan: 19.10.2008"),
-    ("birth_place", "Tug‘ilgan joyingiz (viloyat, tuman)?"),
-    ("nationality", "Millatingiz?"),
-    ("party", "Partiyaviyligingiz? (a’zo bo‘lmasangiz «yo‘q» deb yozing)"),
-    ("education", "Ma’lumotingiz?\nMasalan: o‘rta, tugallanmagan oliy"),
-    ("graduated", "Qachon va qaysi maktab/kollejni tugatgansiz?\nMasalan: 2026 yil, Dehqonobod tumani 92-sonli o‘rta maktab"),
-    ("specialty", "Ma’lumoti bo‘yicha mutaxassisligingiz? (yo‘q bo‘lsa «yo‘q»)"),
-    ("degree", "Ilmiy darajangiz? (yo‘q bo‘lsa «yo‘q»)"),
-    ("rank", "Ilmiy unvoningiz? (yo‘q bo‘lsa «yo‘q»)"),
-    ("languages", "Qaysi chet tillarini bilasiz?\nMasalan: rus tili, ingliz tili"),
-    ("awards", "Davlat mukofotlari bilan taqdirlanganmisiz? (yo‘q bo‘lsa «yo‘q»)"),
-    ("deputy", "Xalq deputatlari Kengashi deputati yoki boshqa saylanadigan organ a’zosimisiz? (yo‘q bo‘lsa «yo‘q»)"),
-    ("univ", "Hozir o‘qiyotgan universitetingiz nomi?"),
-    ("faculty", "Fakultet va yo‘nalishingiz?\nMasalan: Kechki va Sirtqi ta’lim fakulteti (Ingliz tili) yo‘nalishi"),
-    ("enroll", "Universitetga qachon kirgansiz?\nMasalan: 2026 yil 7 sentabr"),
-    ("phone", "Telefon raqamingiz?"),
+    ("fio", "F.I.Sh.", "Familiyangiz, ismingiz va otangizning ismini yozing.\nMasalan: Nursoatova Feruza Muxiddin qizi"),
+    ("birth_date", "Tug‘ilgan sana", "Tug‘ilgan sanangiz (kun.oy.yil)?\nMasalan: 19.10.2008"),
+    ("birth_place", "Tug‘ilgan joy", "Tug‘ilgan joyingiz (viloyat, tuman)?"),
+    ("nationality", "Millati", "Millatingiz?"),
+    ("party", "Partiyaviyligi", "Partiyaviyligingiz? (a’zo bo‘lmasangiz «yo‘q» deb yozing)"),
+    ("education", "Ma’lumoti", "Ma’lumotingiz?\nMasalan: o‘rta, tugallanmagan oliy"),
+    ("graduated", "Tamomlagan", "Qachon va qaysi maktab/kollejni tugatgansiz?\nMasalan: 2026 yil, Dehqonobod tumani 92-sonli o‘rta maktab"),
+    ("specialty", "Mutaxassisligi", "Ma’lumoti bo‘yicha mutaxassisligingiz? (yo‘q bo‘lsa «yo‘q»)"),
+    ("degree", "Ilmiy darajasi", "Ilmiy darajangiz? (yo‘q bo‘lsa «yo‘q»)"),
+    ("rank", "Ilmiy unvoni", "Ilmiy unvoningiz? (yo‘q bo‘lsa «yo‘q»)"),
+    ("languages", "Chet tillari", "Qaysi chet tillarini bilasiz?\nMasalan: rus tili, ingliz tili"),
+    ("awards", "Mukofotlari", "Davlat mukofotlari bilan taqdirlanganmisiz? (yo‘q bo‘lsa «yo‘q»)"),
+    ("deputy", "Deputatligi", "Xalq deputatlari Kengashi deputati yoki boshqa saylanadigan organ a’zosimisiz? (yo‘q bo‘lsa «yo‘q»)"),
+    ("univ", "Universiteti", "Hozir o‘qiyotgan universitetingiz nomi?"),
+    ("faculty", "Fakultet/yo‘nalish", "Fakultet va yo‘nalishingiz?\nMasalan: Kechki va Sirtqi ta’lim fakulteti (Ingliz tili) yo‘nalishi"),
+    ("enroll", "Kirgan sanasi", "Universitetga qachon kirgansiz?\nMasalan: 2026 yil 7 sentabr"),
+    ("phone", "Telefon", "Telefon raqamingiz?"),
 ]
 
 RELATIVE = [
@@ -72,17 +67,57 @@ BTN_REL = InlineKeyboardMarkup([[
 def fresh(ctx):
     ctx.user_data.clear()
     ctx.user_data.update(step="personal", i=0, data={"work": [], "relatives": []},
-                         photo=None, rel={}, ri=0)
+                         photo=None, rel={}, ri=0, from_review=False, edit_rel=None, edit_i=None)
 
 
+# ---------- Tekshiruv (tahrirlash) ekrani ----------
+def review_text(ud):
+    d = ud["data"]
+    lines = ["📋 Barcha javoblaringiz:\n"]
+    for n, (k, label, _) in enumerate(PERSONAL, 1):
+        lines.append(f"{n}. {label}: {d[k]}")
+    lines.append(f"\n📷 Rasm: {'bor' if ud.get('photo') else 'yo‘q'}")
+    lines.append("\n💼 Mehnat faoliyati:")
+    lines += [f"• {w}" for w in d["work"]] or ["—"]
+    lines.append("\n👪 Qarindoshlar:")
+    lines += [f"{n}. {r['kind']} — {r['fio']}" for n, r in enumerate(d["relatives"], 1)] or ["—"]
+    lines.append("\nXato bo‘lsa, shu raqamni bosing (tahrirlash). Hammasi to‘g‘ri bo‘lsa — «Faylni olish».")
+    return "\n".join(lines)
+
+
+def review_kb(ud):
+    d = ud["data"]
+    nums = [InlineKeyboardButton(str(n), callback_data=f"e:{n-1}") for n in range(1, len(PERSONAL) + 1)]
+    rows = [nums[i:i + 6] for i in range(0, len(nums), 6)]
+    rows.append([InlineKeyboardButton("📷 Rasmni o‘zgartirish", callback_data="ephoto")])
+    rows.append([InlineKeyboardButton("💼 Mehnat faoliyatini qayta yozish", callback_data="ework")])
+    for n, r in enumerate(d["relatives"]):
+        rows.append([
+            InlineKeyboardButton(f"✏️ {r['kind'][:18]}", callback_data=f"erel:{n}"),
+            InlineKeyboardButton("🗑 O‘chirish", callback_data=f"drel:{n}"),
+        ])
+    rows.append([InlineKeyboardButton("➕ Qarindosh qo‘shish", callback_data="addrel")])
+    rows.append([InlineKeyboardButton("✅ Faylni olish", callback_data="finish")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_review(msg, ud):
+    ud["step"] = "review"
+    ud["from_review"] = False
+    ud["edit_rel"] = None
+    await msg.reply_text(review_text(ud), reply_markup=review_kb(ud))
+
+
+# ---------- Buyruqlar ----------
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     fresh(ctx)
     await update.message.reply_text(
         "Assalomu alaykum! Men ma’lumotnoma (obyektivka) tayyorlab beraman.\n"
-        "Savollarga birin-ketin javob bering, oxirida tayyor Word fayl olasiz.\n"
-        "Bekor qilish: /cancel, qaytadan boshlash: /start"
+        "Savollarga birin-ketin javob bering. Oxirida hammasini ko‘rsataman — xato bo‘lsa, "
+        "faqat o‘sha joyni tuzatasiz.\n\n"
+        "Bir qadam orqaga qaytish: /orqaga\nBekor qilish: /cancel"
     )
-    await update.message.reply_text(PERSONAL[0][1])
+    await update.message.reply_text(PERSONAL[0][2])
 
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -97,6 +132,50 @@ async def ask_photo(msg):
     )
 
 
+async def back(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ud, msg = ctx.user_data, update.message
+    step = ud.get("step")
+    if not step:
+        await msg.reply_text("Boshlash uchun /start bosing.")
+        return
+    if step == "edit_field":
+        await show_review(msg, ud)
+    elif step == "personal":
+        if ud["i"] > 0:
+            ud["i"] -= 1
+            await msg.reply_text("⬅️ Orqaga qaytdik.\n\n" + PERSONAL[ud["i"]][2])
+        else:
+            await msg.reply_text("Bu birinchi savol, orqaga qaytib bo‘lmaydi.")
+    elif step == "photo":
+        if ud["from_review"]:
+            await show_review(msg, ud)
+        else:
+            ud["step"], ud["i"] = "personal", len(PERSONAL) - 1
+            await msg.reply_text("⬅️ Orqaga qaytdik.\n\n" + PERSONAL[ud["i"]][2])
+    elif step == "work":
+        if ud["from_review"]:
+            await show_review(msg, ud)
+        else:
+            ud["step"] = "photo"
+            await ask_photo(msg)
+    elif step == "relative":
+        if ud["ri"] > 0:
+            ud["ri"] -= 1
+            await msg.reply_text("⬅️ Orqaga qaytdik.\n\n" + RELATIVE[ud["ri"]][1])
+        elif ud["from_review"]:
+            ud["rel"] = {}
+            await show_review(msg, ud)
+        elif ud["data"]["relatives"]:
+            ud["step"], ud["rel"] = "relative_menu", {}
+            await msg.reply_text("Yana qarindosh qo‘shamizmi?", reply_markup=BTN_REL)
+        else:
+            ud["step"], ud["rel"] = "work", {}
+            await msg.reply_text(WORK_HELP)
+    else:
+        await msg.reply_text("Pastdagi tugmalardan foydalaning.")
+
+
+# ---------- Matn / rasm ----------
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     msg = update.message
@@ -107,37 +186,49 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if step == "personal":
-        key = PERSONAL[ud["i"]][0]
-        ud["data"][key] = text
+        ud["data"][PERSONAL[ud["i"]][0]] = text
         ud["i"] += 1
         if ud["i"] < len(PERSONAL):
-            await msg.reply_text(PERSONAL[ud["i"]][1])
+            await msg.reply_text(PERSONAL[ud["i"]][2])
         else:
             ud["step"] = "photo"
             await ask_photo(msg)
 
+    elif step == "edit_field":
+        ud["data"][PERSONAL[ud["edit_i"]][0]] = text
+        await show_review(msg, ud)
+
     elif step == "photo":
         ud["photo"] = None
-        ud["step"] = "work"
-        await msg.reply_text(WORK_HELP)
+        if ud["from_review"]:
+            await show_review(msg, ud)
+        else:
+            ud["step"] = "work"
+            await msg.reply_text(WORK_HELP)
 
     elif step == "work":
         ud["data"]["work"].append(text)
         await msg.reply_text("Qo‘shildi. Yana yozing yoki tugating:", reply_markup=BTN_DONE_WORK)
 
     elif step == "relative":
-        key = RELATIVE[ud["ri"]][0]
-        ud["rel"][key] = text
+        ud["rel"][RELATIVE[ud["ri"]][0]] = text
         ud["ri"] += 1
         if ud["ri"] < len(RELATIVE):
             await msg.reply_text(RELATIVE[ud["ri"]][1])
+            return
+        rel, idx = dict(ud["rel"]), ud["edit_rel"]
+        ud["rel"], ud["ri"] = {}, 0
+        if ud["from_review"]:
+            if idx is None:
+                ud["data"]["relatives"].append(rel)
+            else:
+                ud["data"]["relatives"][idx] = rel
+            await show_review(msg, ud)
         else:
-            ud["data"]["relatives"].append(dict(ud["rel"]))
-            ud["rel"], ud["ri"] = {}, 0
+            ud["data"]["relatives"].append(rel)
             ud["step"] = "relative_menu"
             n = len(ud["data"]["relatives"])
             await msg.reply_text(f"{n}-qarindosh qo‘shildi. Yana qo‘shamizmi?", reply_markup=BTN_REL)
-
     else:
         await msg.reply_text("Iltimos, pastdagi tugmalardan birini bosing.")
 
@@ -150,47 +241,87 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     path = os.path.join(tempfile.gettempdir(), f"photo_{update.effective_user.id}.jpg")
     await f.download_to_drive(path)
     ud["photo"] = path
-    ud["step"] = "work"
     await update.message.reply_text("Rasm qabul qilindi ✅")
-    await update.message.reply_text(WORK_HELP)
+    if ud["from_review"]:
+        await show_review(update.message, ud)
+    else:
+        ud["step"] = "work"
+        await update.message.reply_text(WORK_HELP)
 
 
+# ---------- Tugmalar ----------
 async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     ud = ctx.user_data
-    if not ud.get("step"):
+    msg = q.message
+    step = ud.get("step")
+    if not step:
+        await msg.reply_text("Sessiya tugagan. Qaytadan boshlash uchun /start bosing.")
         return
+    data = q.data
 
-    if q.data == "work_done" and ud["step"] == "work":
+    if data == "work_done" and step == "work":
         if not ud["data"]["work"]:
-            await q.message.reply_text("Hech bo‘lmasa bitta qator yozing (masalan, maktab o‘quvchisi).")
+            await msg.reply_text("Hech bo‘lmasa bitta qator yozing (masalan, maktab o‘quvchisi).")
+            return
+        if ud["from_review"]:
+            await show_review(msg, ud)
             return
         ud["step"] = "relative"
-        await q.message.reply_text(
+        await msg.reply_text(
             "Endi yaqin qarindoshlaringiz: ota, ona, aka-uka, opa-singillar.\n"
-            "Har biri uchun alohida so‘rayman."
+            "Har biri uchun alohida so‘rayman.\n(Xato qilsangiz: /orqaga)"
         )
-        await q.message.reply_text(RELATIVE[0][1])
+        await msg.reply_text(RELATIVE[0][1])
 
-    elif q.data == "rel_more" and ud["step"] == "relative_menu":
+    elif data == "rel_more" and step == "relative_menu":
         ud["step"] = "relative"
-        await q.message.reply_text(RELATIVE[0][1])
+        await msg.reply_text(RELATIVE[0][1])
 
-    elif q.data == "rel_done" and ud["step"] == "relative_menu":
-        await q.message.reply_text("Fayl tayyorlanmoqda…")
-        out = os.path.join(tempfile.gettempdir(), f"Obyektivka_{q.from_user.id}.docx")
-        build_docx(ud["data"], out, ud.get("photo"))
-        name = ud["data"]["fio"].split()[0]
-        with open(out, "rb") as fh:
-            await q.message.reply_document(fh, filename=f"Obyektivka_{name}.docx",
-                                           caption="Tayyor! Tekshirib ko‘ring. Xato bo‘lsa /start bilan qaytadan kiriting.")
-        admin = os.getenv("ADMIN_ID")
-        if admin:
+    elif data == "rel_done" and step == "relative_menu":
+        await show_review(msg, ud)
+
+    elif step == "review":
+        if data.startswith("e:"):
+            i = int(data[2:])
+            ud["step"], ud["edit_i"] = "edit_field", i
+            cur = ud["data"][PERSONAL[i][0]]
+            await msg.reply_text(f"Hozirgi javob: {cur}\n\nYangisini yozing:\n{PERSONAL[i][2]}\n\n(Bekor: /orqaga)")
+        elif data == "ephoto":
+            ud["step"], ud["from_review"] = "photo", True
+            await msg.reply_text("Yangi 3x4 rasmni yuboring (yoki rasmni olib tashlash uchun «yo‘q» deb yozing).")
+        elif data == "ework":
+            ud["step"], ud["from_review"] = "work", True
+            ud["data"]["work"] = []
+            await msg.reply_text(WORK_HELP + "\n\n(Eski yozuvlar o‘chirildi, hammasini qaytadan yozing.)")
+        elif data.startswith("erel:"):
+            n = int(data[5:])
+            ud.update(step="relative", from_review=True, edit_rel=n, rel={}, ri=0)
+            await msg.reply_text(f"{n+1}-qarindoshni qaytadan kiritamiz.\n\n" + RELATIVE[0][1])
+        elif data.startswith("drel:"):
+            n = int(data[5:])
+            if n < len(ud["data"]["relatives"]):
+                ud["data"]["relatives"].pop(n)
+            await show_review(msg, ud)
+        elif data == "addrel":
+            ud.update(step="relative", from_review=True, edit_rel=None, rel={}, ri=0)
+            await msg.reply_text(RELATIVE[0][1])
+        elif data == "finish":
+            await msg.reply_text("Fayl tayyorlanmoqda…")
+            out = os.path.join(tempfile.gettempdir(), f"Obyektivka_{q.from_user.id}.docx")
+            build_docx(ud["data"], out, ud.get("photo"))
+            name = ud["data"]["fio"].split()[0]
             with open(out, "rb") as fh:
-                await ctx.bot.send_document(int(admin), fh, filename=f"Obyektivka_{name}.docx",
-                                            caption=f"Yangi obyektivka: {ud['data']['fio']}")
-        ud.clear()
+                await msg.reply_document(
+                    fh, filename=f"Obyektivka_{name}.docx",
+                    caption="Tayyor! Tekshirib ko‘ring. Yana o‘zgartirish kerak bo‘lsa /start bosing.")
+            admin = os.getenv("ADMIN_ID")
+            if admin:
+                with open(out, "rb") as fh:
+                    await ctx.bot.send_document(int(admin), fh, filename=f"Obyektivka_{name}.docx",
+                                                caption=f"Yangi obyektivka: {ud['data']['fio']}")
+            ud.clear()
 
 
 def main():
@@ -198,12 +329,11 @@ def main():
     app = ApplicationBuilder().token(token).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("cancel", cancel))
+    app.add_handler(CommandHandler("orqaga", back))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
-    # Render (bulut) da RENDER_EXTERNAL_URL avtomatik beriladi -> webhook rejimi.
-    # Kompyuterda bo'lsa shu o'zgaruvchi yo'q -> oddiy polling.
     base_url = os.getenv("RENDER_EXTERNAL_URL")
     if base_url:
         app.run_webhook(
@@ -211,7 +341,6 @@ def main():
             port=int(os.getenv("PORT", "10000")),
             url_path=token,
             webhook_url=f"{base_url}/{token}",
-            drop_pending_updates=False,
         )
     else:
         app.run_polling()
