@@ -3,8 +3,10 @@ Obyektivka (ma'lumotnoma) Telegram boti.
 Savollarni birin-ketin so'raydi, oxirida hammasini ko'rsatib, tahrirlash imkonini beradi
 va tayyor Word (.docx) fayl yuboradi.
 """
+import datetime
 import logging
 import os
+import re
 import tempfile
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -17,7 +19,10 @@ from telegram.ext import (
     filters,
 )
 
+import ai
 from docgen import build_docx
+from paper import build_paper
+from slides import build_pptx
 
 logging.basicConfig(level=logging.INFO)
 
@@ -57,7 +62,59 @@ WORK_HELP = (
     "Hozirgi o‘qishingiz o‘zi avtomatik qo‘shiladi."
 )
 
-BACK_KB = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Bir qadam orqaga", callback_data="back")]])
+MENU_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("📄 Obyektivka tayyorlash", callback_data="m:obyektivka")],
+    [InlineKeyboardButton("📊 Slayd tayyorlash", callback_data="m:slayd")],
+    [InlineKeyboardButton("📝 Mustaqil ish tayyorlash", callback_data="m:mustaqil")],
+    [InlineKeyboardButton("📞 Admin bilan bog‘lanish", callback_data="m:contact")],
+])
+MENU_BTN = InlineKeyboardButton("🏠 Menyu", callback_data="m:menu")
+MENU_TEXT = "Assalomu alaykum! 👋 Nimani tayyorlab beray?"
+
+LANGS = [("🇺🇿 O‘zbekcha", "uz"), ("🇷🇺 Русский", "ru"), ("🇬🇧 English", "en")]
+# forma: (kalit, savol, variantlar yoki None)
+FORMS = {
+    "slayd": [
+        ("topic", "Taqdimot mavzusi nima?", None),
+        ("subject", "Fan nomi? (sarlavha slaydida chiqadi; kerak bo‘lmasa «-» yozing)", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("count", "Jami nechta slayd kerak?", [(str(n), str(n)) for n in (6, 8, 10, 12, 15)]),
+        ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
+    ],
+    "mustaqil": [
+        ("subject", "Fan nomi?", None),
+        ("topic", "Mustaqil ish mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("pages", "Taxminan necha bet kerak?", [(str(n), str(n)) for n in (5, 8, 10, 15, 20)]),
+        ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
+        ("univ", "Universitet nomi? (titul varag‘ida chiqadi)", None),
+        ("teacher", "Qabul qiluvchi o‘qituvchi (F.I.Sh.)? Kerak bo‘lmasa «-» yozing", None),
+    ],
+}
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "3"))
+USAGE = {}  # user_id -> (sana, soni)
+
+
+def is_admin(uid):
+    return str(uid) == str(os.getenv("ADMIN_ID", ""))
+
+
+def quota_left(uid):
+    if is_admin(uid):
+        return 999
+    day = datetime.date.today().isoformat()
+    d, n = USAGE.get(uid, (day, 0))
+    return DAILY_LIMIT - (n if d == day else 0)
+
+
+def quota_use(uid):
+    day = datetime.date.today().isoformat()
+    d, n = USAGE.get(uid, (day, 0))
+    USAGE[uid] = (day, (n if d == day else 0) + 1)
+
+
+BACK_BTN = InlineKeyboardButton("⬅️ Bir qadam orqaga", callback_data="back")
+BACK_KB = InlineKeyboardMarkup([[BACK_BTN]])
 THANKS = (
     "Botdan foydalanganingiz uchun rahmat! 🙏\n\n"
     "Rahmatni ikki xil aytsangiz bo‘ladi 😁\n"
@@ -140,29 +197,127 @@ async def show_review(msg, ud):
 
 
 # ---------- Buyruqlar ----------
+async def send_menu(msg, ud=None):
+    if ud is not None:
+        ud.clear()
+    await msg.reply_text(MENU_TEXT, reply_markup=MENU_KB)
+
+
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await send_menu(update.message, ctx.user_data)
+
+
+async def begin_obyektivka(msg, ctx):
     fresh(ctx)
-    await update.message.reply_text(
-        "Assalomu alaykum! Men ma’lumotnoma (obyektivka) tayyorlab beraman.\n"
-        "Savollarga birin-ketin javob bering. Oxirida hammasini ko‘rsataman — xato bo‘lsa, "
-        "faqat o‘sha joyni tuzatasiz.\n\n"
-        "Bir qadam orqaga qaytish: /orqaga\nBekor qilish: /cancel"
+    ud = ctx.user_data
+    await msg.reply_text(
+        "📄 Obyektivka tayyorlaymiz. Savollarga birin-ketin javob bering. Oxirida hammasini "
+        "ko‘rsataman — xato bo‘lsa, faqat o‘sha joyni tuzatasiz.\n\n"
+        "Bir qadam orqaga: /orqaga yoki tugma. Menyu: /menu"
     )
-    await ask_personal(update.message, ctx.user_data, 0)
+    await ask(msg, ud, PERSONAL[0][2], InlineKeyboardMarkup([[MENU_BTN]]))
+
+
+async def ask_field(msg, ud, prefix=""):
+    key, text, opts = FORMS[ud["form"]][ud["fi"]]
+    rows = []
+    if opts:
+        rows.append([InlineKeyboardButton(lab, callback_data=f"opt:{val}") for lab, val in opts])
+    rows.append([BACK_BTN] if ud["fi"] > 0 else [MENU_BTN])
+    await ask(msg, ud, prefix + text, InlineKeyboardMarkup(rows))
+
+
+async def begin_form(msg, ud, name):
+    ud.clear()
+    ud.update(step="form", form=name, fi=0, fdata={}, busy=False)
+    title = "📊 Slayd" if name == "slayd" else "📝 Mustaqil ish"
+    await msg.reply_text(f"{title} tayyorlaymiz. Bir necha savol beraman. (Orqaga: /orqaga, menyu: /menu)")
+    await ask_field(msg, ud)
+
+
+async def begin_contact(msg, ud):
+    ud.clear()
+    ud["step"] = "contact"
+    await ask(msg, ud, "📞 Xabaringizni yozing, adminga yetkazaman. Admin javobi shu yerga keladi.",
+              InlineKeyboardMarkup([[MENU_BTN]]))
+
+
+async def finish_form(msg, ctx, ud, user):
+    uid = user.id
+    if quota_left(uid) <= 0:
+        await msg.reply_text(
+            f"Bugungi limit ({DAILY_LIMIT} ta) tugadi. Ertaga yana urinib ko‘ring yoki admin bilan bog‘laning.",
+            reply_markup=MENU_KB)
+        ud.clear()
+        return
+    d = ud["fdata"]
+    form = ud["form"]
+    ud["busy"] = True
+    await msg.reply_text("⏳ Tayyorlanmoqda, 1-2 daqiqa kuting…")
+    try:
+        if form == "slayd":
+            n = int(d["count"])
+            slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 1)
+            out = os.path.join(tempfile.gettempdir(), f"slayd_{uid}.pptx")
+            build_pptx(d["topic"], d["subject"], d["author"], slides, out)
+            fname = "Taqdimot.pptx"
+            caption = "Tayyor! ✅ Matnni o‘qib chiqing, kerak bo‘lsa PowerPoint’da tahrirlang."
+        else:
+            text = await ai.make_paper(d["subject"], d["topic"], d["lang"], int(d["pages"]))
+            out = os.path.join(tempfile.gettempdir(), f"ish_{uid}.docx")
+            build_paper(d, text, out)
+            fname = "Mustaqil_ish.docx"
+            caption = ("Tayyor! ✅ Matn sun’iy intellekt yordamida yozilgan: faktlar va adabiyotlar "
+                       "ro‘yxatini albatta tekshirib, o‘zingizga moslab tahrirlang.")
+        with open(out, "rb") as fh:
+            await msg.reply_document(fh, filename=fname, caption=caption)
+        quota_use(uid)
+        await msg.reply_text(THANKS, parse_mode="HTML")
+        await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
+    except ai.AIError as e:
+        logging.warning("AI xato: %s", e)
+        if str(e) == "busy":
+            txt = "Hozir juda ko‘p so‘rov bor. 1-2 daqiqadan keyin qayta urinib ko‘ring."
+        elif str(e) == "no_key":
+            txt = "Sun’iy intellekt hali ulanmagan. Admin bilan bog‘laning."
+        else:
+            txt = "Tayyorlashda xato chiqdi. Birozdan keyin qayta urinib ko‘ring."
+        await msg.reply_text(txt, reply_markup=MENU_KB)
+    except Exception:
+        logging.exception("Generatsiya xatosi")
+        await msg.reply_text("Kutilmagan xato. Qayta urinib ko‘ring.", reply_markup=MENU_KB)
+    ud.clear()
+
+
+async def form_answer(msg, ctx, ud, user, value):
+    ud["fdata"][FORMS[ud["form"]][ud["fi"]][0]] = value
+    ud["fi"] += 1
+    if ud["fi"] < len(FORMS[ud["form"]]):
+        await ask_field(msg, ud)
+    else:
+        await finish_form(msg, ctx, ud, user)
 
 
 async def cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data.clear()
-    await update.message.reply_text("Bekor qilindi. Qaytadan boshlash uchun /start.")
+    await update.message.reply_text("Bekor qilindi.", reply_markup=MENU_KB)
 
 
 async def do_back(msg, ud):
     step = ud.get("step")
     if not step:
-        await msg.reply_text("Boshlash uchun /start bosing.")
+        await send_menu(msg, ud)
         return
     if step == "edit_field":
         await show_review(msg, ud)
+    elif step == "form":
+        if ud["fi"] > 0:
+            ud["fi"] -= 1
+            await ask_field(msg, ud, "⬅️ Orqaga qaytdik.\n\n")
+        else:
+            await msg.reply_text("Bu birinchi savol. Menyuga qaytish: /menu")
+    elif step == "contact":
+        await send_menu(msg, ud)
     elif step == "personal":
         if ud["i"] > 0:
             ud["i"] -= 1
@@ -210,11 +365,52 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     msg = update.message
     text = (msg.text or "").strip()
+    user = update.effective_user
+
+    # admin foydalanuvchi xabariga javob yozsa — foydalanuvchiga yuboriladi
+    if is_admin(user.id) and msg.reply_to_message and msg.reply_to_message.text:
+        m = re.search(r"ID:\s*(\d+)", msg.reply_to_message.text)
+        if m:
+            try:
+                await ctx.bot.send_message(
+                    int(m.group(1)), f"👨‍💻 Admin javobi:\n\n{text}",
+                    reply_markup=InlineKeyboardMarkup(
+                        [[InlineKeyboardButton("✍️ Javob yozish", callback_data="m:contact")]]))
+                await msg.reply_text("Yuborildi ✅")
+            except Exception:
+                await msg.reply_text("Yuborib bo‘lmadi (foydalanuvchi botni to‘xtatgan bo‘lishi mumkin).")
+            return
+
     step = ud.get("step")
     if not step:
-        await msg.reply_text("Boshlash uchun /start bosing.")
+        await send_menu(msg, ud)
+        return
+    if ud.get("busy"):
+        await msg.reply_text("⏳ Hozir tayyorlanmoqda, biroz kuting…")
         return
     await drop_kb(ud)
+
+    if step == "contact":
+        admin = os.getenv("ADMIN_ID")
+        if not admin:
+            await msg.reply_text("Admin hozircha ulanmagan.", reply_markup=MENU_KB)
+        else:
+            name = user.full_name + (f" (@{user.username})" if user.username else "")
+            await ctx.bot.send_message(int(admin), f"📩 Yangi xabar\n👤 {name}\nID: {user.id}\n\n{text}")
+            await msg.reply_text("Xabaringiz adminga yuborildi ✅ Javob shu yerga keladi.", reply_markup=MENU_KB)
+        ud.clear()
+        return
+
+    if step == "form":
+        opts = FORMS[ud["form"]][ud["fi"]][2]
+        if opts:
+            hit = next((v for lab, v in opts if text.lower() in (v.lower(), lab.lower())), None)
+            if hit is None:
+                await msg.reply_text("Iltimos, yuqoridagi tugmalardan birini tanlang.")
+                return
+            text = hit
+        await form_answer(msg, ctx, ud, user, text)
+        return
 
     if step == "personal":
         ud["data"][PERSONAL[ud["i"]][0]] = text
@@ -288,11 +484,31 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     msg = q.message
     step = ud.get("step")
-    if not step:
-        await msg.reply_text("Sessiya tugagan. Qaytadan boshlash uchun /start bosing.")
-        return
     data = q.data
+
+    if data.startswith("m:"):
+        await drop_kb(ud)
+        what = data[2:]
+        if what == "obyektivka":
+            await begin_obyektivka(msg, ctx)
+        elif what in ("slayd", "mustaqil"):
+            await begin_form(msg, ud, what)
+        elif what == "contact":
+            await begin_contact(msg, ud)
+        else:
+            await send_menu(msg, ud)
+        return
+
+    if not step:
+        await msg.reply_text("Sessiya tugagan. Menyuga qaytamiz:", reply_markup=MENU_KB)
+        return
+    if ud.get("busy"):
+        return
     await drop_kb(ud)
+
+    if data.startswith("opt:") and step == "form":
+        await form_answer(msg, ctx, ud, q.from_user, data[4:])
+        return
 
     if data == "back":
         await do_back(msg, ud)
@@ -354,6 +570,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     fh, filename=f"Obyektivka_{name}.docx",
                     caption="Tayyor! Tekshirib ko‘ring. Yana o‘zgartirish kerak bo‘lsa /start bosing.")
             await msg.reply_text(THANKS, parse_mode="HTML")
+            await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
             admin = os.getenv("ADMIN_ID")
             if admin:
                 with open(out, "rb") as fh:
@@ -364,8 +581,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def main():
     token = os.environ["BOT_TOKEN"]
-    app = ApplicationBuilder().token(token).build()
+    app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("menu", start))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("orqaga", back))
     app.add_handler(CallbackQueryHandler(on_button))
