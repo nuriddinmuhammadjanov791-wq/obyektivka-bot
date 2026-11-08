@@ -4,7 +4,10 @@ import json
 import os
 import re
 
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+# Google modellarni tez almashtirib turadi: 404 bo'lsa keyingisiga o'tadi.
+MODELS = [m for m in (os.getenv("GEMINI_MODEL"), "gemini-3.1-flash-lite", "gemini-3.8-flash",
+                      "gemini-3.5-flash-lite") if m]
+_good = None  # oxirgi ishlagan model
 _sem = asyncio.Semaphore(3)  # bir vaqtda ko'pi bilan 3 ta so'rov
 
 
@@ -12,33 +15,46 @@ class AIError(Exception):
     pass
 
 
+async def _call(c, model, key, cfg, prompt):
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    think = True
+    r = None
+    for attempt in range(3):
+        gc = dict(cfg)
+        if think:
+            gc["thinkingConfig"] = {"thinkingBudget": 0}  # tezroq va kamroq kvota
+        body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gc}
+        r = await c.post(url, json=body, headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+        if r.status_code == 400 and think:
+            think = False
+            continue
+        if r.status_code in (429, 500, 503):
+            await asyncio.sleep(4 * (attempt + 1))
+            continue
+        break
+    return r
+
+
 async def generate(prompt: str, json_mode: bool = False, max_tokens: int = 8192) -> str:
+    global _good
     import httpx  # python-telegram-bot bilan birga o'rnatiladi
 
     key = os.getenv("GEMINI_API_KEY")
     if not key:
         raise AIError("no_key")
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/{MODEL}:generateContent"
     cfg = {"temperature": 0.7, "maxOutputTokens": max_tokens}
     if json_mode:
         cfg["responseMimeType"] = "application/json"
-    think = True
+    order = ([_good] if _good else []) + [m for m in MODELS if m != _good]
     r = None
     async with _sem:
         async with httpx.AsyncClient(timeout=240) as c:
-            for attempt in range(3):
-                gc = dict(cfg)
-                if think:
-                    gc["thinkingConfig"] = {"thinkingBudget": 0}  # tezroq va kamroq kvota
-                body = {"contents": [{"parts": [{"text": prompt}]}], "generationConfig": gc}
-                r = await c.post(url, json=body,
-                                 headers={"x-goog-api-key": key, "Content-Type": "application/json"})
-                if r.status_code == 400 and think:
-                    think = False
+            for model in order:
+                r = await _call(c, model, key, cfg, prompt)
+                if r.status_code == 404:  # model topilmadi -> keyingisi
                     continue
-                if r.status_code in (429, 500, 503):
-                    await asyncio.sleep(4 * (attempt + 1))
-                    continue
+                if r.status_code == 200:
+                    _good = model
                 break
     if r.status_code == 429:
         raise AIError("busy")
