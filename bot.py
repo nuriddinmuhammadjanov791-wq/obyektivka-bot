@@ -22,7 +22,8 @@ from telegram.ext import (
 import ai
 from docgen import build_docx
 from paper import build_paper
-from slides import build_pptx
+import images
+from slides import BOT_TAG, IMG_RATIO, THEME_OPTIONS, build_pptx
 
 logging.basicConfig(level=logging.INFO)
 
@@ -78,7 +79,9 @@ FORMS = {
         ("topic", "Taqdimot mavzusi nima?", None),
         ("subject", "Fan nomi? (sarlavha slaydida chiqadi; kerak bo‘lmasa «-» yozing)", None),
         ("lang", "Qaysi tilda bo‘lsin?", LANGS),
-        ("count", "Jami nechta slayd kerak?", [(str(n), str(n)) for n in (6, 8, 10, 12, 15)]),
+        ("count", "Jami nechta slayd kerak? (sarlavha, reja va yakuniy sahifa ham kiradi)",
+         [(str(n), str(n)) for n in (8, 10, 12, 15, 20)]),
+        ("theme", "Slayd uslubini (shablonini) tanlang:", THEME_OPTIONS),
         ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
     ],
     "mustaqil": [
@@ -113,6 +116,8 @@ def quota_use(uid):
     USAGE[uid] = (day, (n if d == day else 0) + 1)
 
 
+PROMO = (f"✨ {BOT_TAG} — slayd, mustaqil ish va obyektivkani bir daqiqada tayyorlaydigan bot. "
+         "Do‘stlaringizga ham ulashing!")
 BACK_BTN = InlineKeyboardButton("⬅️ Bir qadam orqaga", callback_data="back")
 BACK_KB = InlineKeyboardMarkup([[BACK_BTN]])
 THANKS = (
@@ -222,7 +227,8 @@ async def ask_field(msg, ud, prefix=""):
     key, text, opts = FORMS[ud["form"]][ud["fi"]]
     rows = []
     if opts:
-        rows.append([InlineKeyboardButton(lab, callback_data=f"opt:{val}") for lab, val in opts])
+        btns = [InlineKeyboardButton(lab, callback_data=f"opt:{val}") for lab, val in opts]
+        rows += [btns[i:i + 3] for i in range(0, len(btns), 3)]
     rows.append([BACK_BTN] if ud["fi"] > 0 else [MENU_BTN])
     await ask(msg, ud, prefix + text, InlineKeyboardMarkup(rows))
 
@@ -253,22 +259,26 @@ async def finish_form(msg, ctx, ud, user):
     d = ud["fdata"]
     form = ud["form"]
     ud["busy"] = True
-    await msg.reply_text("⏳ Tayyorlanmoqda, 1-2 daqiqa kuting…")
+    await msg.reply_text("⏳ Tayyorlanmoqda, 2-3 daqiqa kuting (matn va rasmlar tayyorlanmoqda)…")
     try:
         if form == "slayd":
             n = int(d["count"])
-            slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 1)
+            slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 3)
+            pics = await images.fetch_all([x.get("image_query", "") for x in slides], IMG_RATIO)
+            for x, p in zip(slides, pics):
+                x["img"] = p
             out = os.path.join(tempfile.gettempdir(), f"slayd_{uid}.pptx")
-            build_pptx(d["topic"], d["subject"], d["author"], slides, out)
+            build_pptx(d["topic"], d["subject"], d["author"], slides, out, d["theme"], d["lang"])
             fname = "Taqdimot.pptx"
-            caption = "Tayyor! ✅ Matnni o‘qib chiqing, kerak bo‘lsa PowerPoint’da tahrirlang."
+            caption = ("Tayyor! ✅ Har bir slaydning izohi (notes) ham bor. Matnni o‘qib chiqing, kerak bo‘lsa "
+                       "PowerPoint’da tahrirlang.\n\n" + PROMO)
         else:
             text = await ai.make_paper(d["subject"], d["topic"], d["lang"], int(d["pages"]))
             out = os.path.join(tempfile.gettempdir(), f"ish_{uid}.docx")
             build_paper(d, text, out)
             fname = "Mustaqil_ish.docx"
             caption = ("Tayyor! ✅ Matn sun’iy intellekt yordamida yozilgan: faktlar va adabiyotlar "
-                       "ro‘yxatini albatta tekshirib, o‘zingizga moslab tahrirlang.")
+                       "ro‘yxatini albatta tekshirib, o‘zingizga moslab tahrirlang.\n\n" + PROMO)
         with open(out, "rb") as fh:
             await msg.reply_document(fh, filename=fname, caption=caption)
         quota_use(uid)
@@ -568,7 +578,7 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             with open(out, "rb") as fh:
                 await msg.reply_document(
                     fh, filename=f"Obyektivka_{name}.docx",
-                    caption="Tayyor! Tekshirib ko‘ring. Yana o‘zgartirish kerak bo‘lsa /start bosing.")
+                    caption="Tayyor! Tekshirib ko‘ring. Yana o‘zgartirish kerak bo‘lsa /menu bosing.\n\n" + PROMO)
             await msg.reply_text(THANKS, parse_mode="HTML")
             await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
             admin = os.getenv("ADMIN_ID")

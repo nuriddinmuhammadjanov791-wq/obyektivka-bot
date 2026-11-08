@@ -79,25 +79,34 @@ def parse_json(text: str):
 LANG_NAME = {"uz": "Uzbek (Latin script, correct modern orthography)", "ru": "Russian", "en": "English"}
 
 
-async def make_slides(topic, subject, lang, content_slides):
-    prompt = f"""You are an expert university teacher. Create the content of a presentation.
-Language: {LANG_NAME[lang]}
+async def make_slides(topic, subject, lang, k):
+    prompt = f"""You are an experienced university professor preparing a presentation that must impress teachers and classmates.
+Language of ALL text: {LANG_NAME[lang]}
 Subject: {subject}
 Topic: {topic}
-Number of content slides: exactly {content_slides} (do NOT include a title slide).
+Create exactly {k} content slides (NO title slide, NO agenda slide, NO thank-you slide: they are added automatically). The LAST slide must be the conclusion.
 Rules:
-- The first content slide is an outline/introduction, the last one is a conclusion.
-- Each slide: a short title (max 8 words) and 3-5 bullet points, each at most 18 words, factual and clear.
-- Do not invent statistics or quotes. No markdown, no numbering inside bullets.
-Return ONLY JSON: {{"slides":[{{"title":"...","bullets":["...","..."]}}]}}"""
-    text = await generate(prompt, json_mode=True, max_tokens=8192)
+- Slide title: at most 7 words.
+- 4 or 5 bullets per slide; each bullet is ONE complete, informative sentence of 10-18 words with concrete content (terms, dates, names, causes, examples). Use only well-established facts; never invent statistics, quotes or sources.
+- key_point: one memorable takeaway sentence, at most 14 words.
+- image_query: for about half of the slides give 2-4 ENGLISH words naming something concrete and photographable that fits the slide (e.g. "Registan Samarkand", "solar panels field"); otherwise an empty string. Never ask for images of real private persons. Conclusion slide: empty.
+- notes: 2-3 sentences the presenter can say aloud for this slide.
+- Logical flow: background, main parts, examples/significance, conclusion. Do not repeat content between slides.
+Return ONLY JSON: {{"slides":[{{"title":"","bullets":[""],"key_point":"","image_query":"","notes":""}}]}}"""
+    text = await generate(prompt, json_mode=True, max_tokens=24000)
     data = parse_json(text)
     slides = []
     for s in data["slides"]:
-        title = str(s["title"]).strip()
-        bullets = [str(b).strip() for b in s["bullets"] if str(b).strip()]
+        title = str(s.get("title", "")).strip()
+        bullets = [str(b).strip() for b in s.get("bullets", []) if str(b).strip()][:5]
         if title and bullets:
-            slides.append({"title": title, "bullets": bullets})
+            slides.append({
+                "title": title,
+                "bullets": bullets,
+                "key_point": str(s.get("key_point", "")).strip(),
+                "image_query": str(s.get("image_query", "")).strip(),
+                "notes": str(s.get("notes", "")).strip(),
+            })
     if not slides:
         raise AIError("empty")
     return slides
