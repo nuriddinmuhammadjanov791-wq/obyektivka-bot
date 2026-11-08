@@ -10,7 +10,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
-BOT_TAG = os.getenv("BOT_TAG", "@clooerai")
+BOT_TAG = os.getenv("BOT_TAG", "@cylooerai")
 W_IN, H_IN = 13.333, 7.5
 
 LABELS = {
