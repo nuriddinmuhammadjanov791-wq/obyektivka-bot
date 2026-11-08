@@ -1,4 +1,4 @@
-"""Slaydlar uchun mavzuga mos rasmlar: Pexels (kalit bo'lsa), aks holda Wikimedia Commons."""
+"""Slaydlar uchun mavzuga mos rasmlar: Pexels / Pixabay (kalit bo'lsa), aks holda Wikimedia Commons."""
 import asyncio
 import io
 import os
@@ -43,6 +43,21 @@ async def _pexels(c, query, key):
     return None
 
 
+async def _pixabay(c, query, key):
+    r = await c.get("https://pixabay.com/api/", params={
+        "key": key, "q": query, "image_type": "photo", "orientation": "horizontal",
+        "per_page": 5, "safesearch": "true", "min_width": 800})
+    if r.status_code != 200:
+        return None
+    for p in r.json().get("hits", []):
+        url = p.get("largeImageURL") or p.get("webformatURL")
+        if url:
+            d = await c.get(url)
+            if d.status_code == 200:
+                return d.content
+    return None
+
+
 async def _wikimedia(c, query):
     r = await c.get("https://commons.wikimedia.org/w/api.php", params={
         "action": "query", "format": "json", "generator": "search",
@@ -71,6 +86,7 @@ async def fetch_all(queries, ratio):
     import httpx
 
     key = os.getenv("PEXELS_API_KEY")
+    pix = os.getenv("PIXABAY_API_KEY")
     sem = asyncio.Semaphore(4)
 
     async def one(c, q):
@@ -81,6 +97,8 @@ async def fetch_all(queries, ratio):
                 raw = None
                 if key:
                     raw = await _pexels(c, q, key)
+                if raw is None and pix:
+                    raw = await _pixabay(c, q, pix)
                 if raw is None:
                     raw = await _wikimedia(c, q)
                 return prepare(raw, ratio) if raw else None
