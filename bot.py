@@ -124,7 +124,7 @@ THANKS = (
     "Botdan foydalanganingiz uchun rahmat! 🙏\n\n"
     "Rahmatni ikki xil aytsangiz bo‘ladi 😁\n"
     "💳 <code>5614688708547111</code> N.M orqali 😅\n"
-    "✍️ yoki @nuriddin26 ga samimiy yozib qo‘yish orqali 😊"
+    "✍️ yoki adminga ga samimiy yozib qo‘yish orqali 😊"
 )
 
 BTN_DONE_WORK = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tayyor", callback_data="work_done")]])
