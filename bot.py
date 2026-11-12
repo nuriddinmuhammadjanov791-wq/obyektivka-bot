@@ -4,6 +4,7 @@ Savollarni birin-ketin so'raydi, oxirida hammasini ko'rsatib, tahrirlash imkonin
 va tayyor Word (.docx) fayl yuboradi.
 """
 import asyncio
+import collections
 import datetime
 import html
 import io
@@ -12,6 +13,7 @@ import os
 import random
 import re
 import tempfile
+import time
 import zipfile
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -25,6 +27,7 @@ from telegram.ext import (
 )
 
 import ai
+from store import store
 from docgen import build_docx
 import crossword
 import paper
@@ -80,6 +83,7 @@ MENU_KB = _kb(
     [("📚 Boshqa hujjatlar", "m:docs"), ("🧰 O‘quv materiallari", "m:edu")],
     [("🖼 Rasmni PDF qilish", "m:pdf"), ("🗜 ZIP qilish", "m:zip")],
     [("🤖 AI yordamchi (savol-javob)", "m:ai")],
+    [("👤 Profilim", "m:profil"), ("📖 Qo‘llanma", "m:help")],
     [("📞 Admin bilan bog‘lanish", "m:contact")],
 )
 AI_KB = _kb([("🧹 Yangi suhbat", "ai:new"), ("🏠 Menyu", "m:menu")])
@@ -96,6 +100,12 @@ EDU_KB = _kb(
     [("🧩 Krossvord", "m:krossvord")],
     [("🏠 Menyu", "m:menu")],
 )
+def rate_kb(form):
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("👍 Yoqdi", callback_data=f"rate:{form}:up"),
+          InlineKeyboardButton("👎 Yoqmadi", callback_data=f"rate:{form}:down")]] + list(MENU_KB.inline_keyboard))
+
+
 PDF_KB = _kb([("✅ PDF qilish", "pdf:make"), ("🗑 Tozalash", "pdf:clear")], [("🏠 Menyu", "m:menu")])
 ZIP_KB = _kb([("✅ ZIP qilish", "zip:make"), ("🗑 Tozalash", "zip:clear")], [("🏠 Menyu", "m:menu")])
 MAX_PDF = 20
@@ -189,7 +199,14 @@ FORMS = {
         ("count", "Nechta so‘z?", _nums(10, 15, 20)),
     ],
 }
+FORMS["profil"] = [
+    ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
+    ("univ", "Universitet nomi?", None),
+    ("faculty", "Fakultet va yo‘nalish? Kerak bo‘lmasa «-» yozing", None),
+    ("city", "Shahar? Kerak bo‘lmasa «-» yozing", None),
+]
 FORM_TITLES = {
+    "profil": "👤 Profil",
     "slayd": "📊 Slayd", "mustaqil": "📝 Mustaqil ish / Referat", "kurs": "🎓 Kurs ishi", "insho": "✍️ Insho",
     "maqola": "📰 Ilmiy maqola", "tezis": "📄 Tezis", "keys": "💼 Keys", "test": "📝 Test",
     "glossariy": "📖 Glossariy", "krossvord": "🧩 Krossvord",
@@ -200,6 +217,69 @@ USAGE = {}  # user_id -> (sana, soni)
 
 def is_admin(uid):
     return str(uid) == str(os.getenv("ADMIN_ID", ""))
+
+
+_hits = {}
+_warned = {}
+RATE = {"msg": (8, 10), "media": (30, 10)}  # (nechta, necha soniyada)
+PROFILE_KEYS = {
+    "slayd": ["author"], "insho": ["author"], "keys": ["author"],
+    "mustaqil": ["author", "univ", "faculty", "city"], "kurs": ["author", "univ", "faculty", "city"],
+}
+PROFILE_LABELS = {"author": "Muallif", "univ": "Universitet", "faculty": "Fakultet/yo‘nalish", "city": "Shahar"}
+HELP_TEXT = (
+    "📖 Qo‘llanma\n\n"
+    "📄 Obyektivka — savollarga javob bering, tayyor Word fayl olasiz.\n"
+    "📊 Slayd — mavzu, til, shablon tanlang; rasmli taqdimot (.pptx).\n"
+    "📝 Mustaqil ish / Referat, 🎓 Kurs ishi, 📰 Maqola, 📄 Tezis, ✍️ Insho, 💼 Keys — davlat talablariga "
+    "(A4, TNR 14, 1,5 interval, chekkalar) mos Word fayl.\n"
+    "🧰 Test, Glossariy, Krossvord — o‘quv materiallari.\n"
+    "🖼 Rasmni PDF, 🗜 ZIP — fayllarni o‘zgartirish (AI kerak emas).\n"
+    "🤖 AI yordamchi — istalgan savolga javob.\n\n"
+    f"Limit: kuniga {DAILY_LIMIT} ta hujjat va {CHAT_LIMIT} ta AI xabar.\n"
+    "👤 Profilim — ism, universitet bir marta saqlanadi, qayta so‘ralmaydi.\n\n"
+    "Buyruqlar: /menu — bosh menyu, /orqaga — bir qadam orqaga, /profil, /yordam, /cancel.\n"
+    "Muhim: AI yozgan matnni albatta o‘qib chiqib, faktlarni tekshiring va o‘zingizga moslang."
+)
+
+
+def allowed(uid, kind="msg"):
+    if is_admin(uid):
+        return True
+    n, per = RATE[kind]
+    now = time.monotonic()
+    dq = _hits.setdefault((uid, kind), collections.deque())
+    while dq and now - dq[0] > per:
+        dq.popleft()
+    if len(dq) >= n:
+        return False
+    dq.append(now)
+    return True
+
+
+async def guard(user, msg, kind="msg"):
+    """Foydalanuvchini hisobga oladi va juda tez yozayotganini to'xtatadi."""
+    store.touch(user)
+    if allowed(user.id, kind):
+        return True
+    now = time.monotonic()
+    last = _warned.get(user.id)
+    if last is None or now - last > 10:
+        _warned[user.id] = now
+        try:
+            await msg.reply_text("⏳ Juda tez yubordingiz. Biroz sekinroq 🙂")
+        except Exception:
+            pass
+    return False
+
+
+async def notify_admin(ctx, text):
+    admin = os.getenv("ADMIN_ID")
+    if admin:
+        try:
+            await ctx.bot.send_message(int(admin), text[:3500])
+        except Exception:
+            pass
 
 
 def quota_left(uid):
@@ -309,7 +389,35 @@ async def send_menu(msg, ud=None):
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update.effective_user, update.message):
+        return
     await send_menu(update.message, ctx.user_data)
+
+
+async def profil_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update.effective_user, update.message):
+        return
+    ctx.user_data.clear()
+    await show_profile(update.message, update.effective_user.id)
+
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not await guard(update.effective_user, update.message):
+        return
+    await update.message.reply_text(HELP_TEXT, reply_markup=MENU_KB)
+
+
+async def stat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return  # oddiy foydalanuvchiga hech narsa bildirmaymiz
+    logging.info("ADMIN uid=%s cmd=/stat", u.id)
+    await update.message.reply_text(store.stats_text())
+
+
+async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
+    logging.error("Handler xatosi", exc_info=ctx.error)
+    await notify_admin(ctx, f"⚠️ Bot xatosi: {type(ctx.error).__name__}: {ctx.error}")
 
 
 async def begin_obyektivka(msg, ctx):
@@ -333,12 +441,37 @@ async def ask_field(msg, ud, prefix=""):
     await ask(msg, ud, prefix + text, InlineKeyboardMarkup(rows))
 
 
-async def begin_form(msg, ud, name):
+def advance(ud):
+    form = FORMS[ud["form"]]
+    ud["fi"] += 1
+    while ud["fi"] < len(form) and form[ud["fi"]][0] in ud.get("prefill", {}):
+        ud["fi"] += 1
+
+
+async def begin_form(msg, ud, name, uid=None):
     ud.clear()
-    ud.update(step="form", form=name, fi=0, fdata={}, busy=False)
+    prof = store.profile(uid) if uid else {}
+    prefill = {k: prof[k] for k in PROFILE_KEYS.get(name, []) if prof.get(k)}
+    ud.update(step="form", form=name, fi=-1, fdata=dict(prefill), prefill=prefill, busy=False)
+    advance(ud)
     await msg.reply_text(f"{FORM_TITLES[name]} tayyorlaymiz. Bir necha savol beraman. "
                          "(Orqaga: /orqaga, menyu: /menu)")
+    if prefill:
+        names = ", ".join(PROFILE_LABELS[k] for k in prefill)
+        await msg.reply_text(f"💾 Profilingizdan olindi: {names}. O‘zgartirish uchun «⬅️ Orqaga» yoki 👤 Profilim.")
     await ask_field(msg, ud)
+
+
+async def show_profile(msg, uid):
+    prof = store.profile(uid)
+    if prof:
+        body = "\n".join(f"• {PROFILE_LABELS.get(k, k)}: {v}" for k, v in prof.items())
+        text = "👤 Profilingiz:\n" + body + "\n\nBu ma’lumotlar keyingi hujjatlarda qayta so‘ralmaydi."
+    else:
+        text = ("👤 Profilingiz hali bo‘sh. Birinchi hujjatni tayyorlaganingizda ism va universitet "
+                "avtomatik saqlanadi, yoki hozir o‘zingiz kiriting.")
+    await msg.reply_text(text, reply_markup=_kb(
+        [("✏️ O‘zgartirish", "m:profedit"), ("🗑 O‘chirish", "prof:del")], [("🏠 Menyu", "m:menu")]))
 
 
 async def begin_pdf(msg, ud):
@@ -585,13 +718,18 @@ async def build_output(form, d, uid):
 
 async def finish_form(msg, ctx, ud, user):
     uid = user.id
-    if quota_left(uid) <= 0:
+    if ud["form"] != "profil" and quota_left(uid) <= 0:
         await msg.reply_text(
             f"Bugungi limit ({DAILY_LIMIT} ta) tugadi. Ertaga yana urinib ko‘ring yoki admin bilan bog‘laning.",
             reply_markup=MENU_KB)
         ud.clear()
         return
     d, form = ud["fdata"], ud["form"]
+    if form == "profil":
+        store.set_profile(uid, **{k: v for k, v in d.items() if v and v not in ("-", "—")})
+        await msg.reply_text("✅ Profil saqlandi.", reply_markup=MENU_KB)
+        ud.clear()
+        return
     ud["busy"] = True
     await msg.reply_text(f"⏳ Tayyorlanmoqda, {WAIT_TEXT.get(form, '1-3 daqiqa')} kuting…")
     try:
@@ -599,10 +737,17 @@ async def finish_form(msg, ctx, ud, user):
         with open(out, "rb") as fh:
             await msg.reply_document(fh, filename=fname, caption=caption + "\n\n" + PROMO)
         quota_use(uid)
+        store.count(form)
+        changed = store.save_from_form(uid, PROFILE_KEYS.get(form, []), d)
         await msg.reply_text(THANKS, parse_mode="HTML")
-        await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
+        if changed:
+            await msg.reply_text("💾 Ma’lumotlaringiz profilga saqlandi, keyingi safar qayta so‘ralmaydi "
+                                 "(o‘zgartirish: 👤 Profilim).")
+        await msg.reply_text("Natija yoqdimi? Yana nima kerak?", reply_markup=rate_kb(form))
     except ai.AIError as e:
         logging.warning("AI xato: %s", e)
+        if str(e) != "busy":
+            await notify_admin(ctx, f"⚠️ {form} xatosi (user {uid}): {e}")
         if str(e) == "busy":
             txt = "Hozir juda ko‘p so‘rov bor. 1-2 daqiqadan keyin qayta urinib ko‘ring."
         elif str(e) == "no_key":
@@ -610,15 +755,16 @@ async def finish_form(msg, ctx, ud, user):
         else:
             txt = "Tayyorlashda xato chiqdi. Birozdan keyin qayta urinib ko‘ring."
         await msg.reply_text(txt, reply_markup=MENU_KB)
-    except Exception:
+    except Exception as e:
         logging.exception("Generatsiya xatosi")
+        await notify_admin(ctx, f"⚠️ {form} kutilmagan xato (user {uid}): {type(e).__name__}: {e}")
         await msg.reply_text("Kutilmagan xato. Qayta urinib ko‘ring.", reply_markup=MENU_KB)
     ud.clear()
 
 
 async def form_answer(msg, ctx, ud, user, value):
     ud["fdata"][FORMS[ud["form"]][ud["fi"]][0]] = value
-    ud["fi"] += 1
+    advance(ud)
     if ud["fi"] < len(FORMS[ud["form"]]):
         await ask_field(msg, ud)
     else:
@@ -693,6 +839,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     text = (msg.text or "").strip()
     user = update.effective_user
+    if not await guard(user, msg):
+        return
 
     # admin foydalanuvchi xabariga javob yozsa — foydalanuvchiga yuboriladi
     if is_admin(user.id) and msg.reply_to_message and msg.reply_to_message.text:
@@ -794,6 +942,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
     msg = update.message
+    if not await guard(update.effective_user, msg, "media"):
+        return
     if not ud.get("step"):  # menyuda turib rasm yuborsa — PDF rejimini o'zi boshlaymiz
         await begin_pdf(msg, ud)
     step = ud.get("step")
@@ -824,6 +974,8 @@ async def on_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Fayl sifatida yuborilgan hujjat/rasm."""
     ud = ctx.user_data
     msg = update.message
+    if not await guard(update.effective_user, msg, "media"):
+        return
     doc = msg.document
     is_img = (doc.mime_type or "").startswith("image/")
     if not ud.get("step"):
@@ -847,7 +999,7 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Video/audio — faqat ZIP rejimida."""
     ud = ctx.user_data
     msg = update.message
-    if ud.get("step") != "zip":
+    if ud.get("step") != "zip" or not await guard(update.effective_user, msg, "media"):
         return
     m = msg.video or msg.audio
     name = getattr(m, "file_name", None) or f"{'video' if msg.video else 'audio'}_{msg.message_id}"
@@ -862,14 +1014,39 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = q.message
     step = ud.get("step")
     data = q.data
+    if not await guard(q.from_user, msg):
+        return
+
+    if data.startswith("rate:"):
+        _, form, val = data.split(":")
+        store.rate(form, val == "up")
+        try:
+            await msg.edit_reply_markup(reply_markup=MENU_KB)
+        except Exception:
+            pass
+        await msg.reply_text("Rahmat! 🙏" if val == "up" else
+                             "Rahmat! Nima yoqmaganini «📞 Admin bilan bog‘lanish» orqali yozsangiz, tuzatamiz.")
+        return
+    if data == "prof:del":
+        store.clear_profile(q.from_user.id)
+        await msg.reply_text("🗑 Profil o‘chirildi.", reply_markup=MENU_KB)
+        return
 
     if data.startswith("m:"):
         await drop_kb(ud)
         what = data[2:]
         if what == "obyektivka":
             await begin_obyektivka(msg, ctx)
+        elif what == "profil":
+            ud.clear()
+            await show_profile(msg, q.from_user.id)
+        elif what == "profedit":
+            await begin_form(msg, ud, "profil", q.from_user.id)
+        elif what == "help":
+            ud.clear()
+            await msg.reply_text(HELP_TEXT, reply_markup=MENU_KB)
         elif what in FORMS:
-            await begin_form(msg, ud, what)
+            await begin_form(msg, ud, what, q.from_user.id)
         elif what == "docs":
             ud.clear()
             await msg.reply_text("📚 Qaysi hujjatni tayyorlaymiz?", reply_markup=DOCS_KB)
@@ -1009,8 +1186,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 await msg.reply_document(
                     fh, filename=f"Obyektivka_{name}.docx",
                     caption="Tayyor! Tekshirib ko‘ring. Yana o‘zgartirish kerak bo‘lsa /menu bosing.\n\n" + PROMO)
+            store.count("obyektivka")
             await msg.reply_text(THANKS, parse_mode="HTML")
-            await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
+            await msg.reply_text("Natija yoqdimi? Yana nima kerak?", reply_markup=rate_kb("obyektivka"))
             admin = os.getenv("ADMIN_ID")
             if admin:
                 with open(out, "rb") as fh:
@@ -1024,6 +1202,10 @@ def main():
     app = ApplicationBuilder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("menu", start))
+    app.add_handler(CommandHandler("profil", profil_cmd))
+    app.add_handler(CommandHandler("yordam", help_cmd))
+    app.add_handler(CommandHandler("stat", stat_cmd))
+    app.add_error_handler(on_error)
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("orqaga", back))
     app.add_handler(CallbackQueryHandler(on_button))
