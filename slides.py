@@ -10,7 +10,7 @@ from pptx.enum.shapes import MSO_SHAPE
 from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
 from pptx.util import Inches, Pt
 
-BOT_TAG = os.getenv("BOT_TAG", "@cylooerai")
+BOT_TAG = os.getenv("BOT_TAG", "@clooerai")
 W_IN, H_IN = 13.333, 7.5
 
 LABELS = {
@@ -141,7 +141,7 @@ def decor_it(s, kind, i, th):
     rect(s, 0, 0, W_IN, 0.5, "161B22")
     for k, col in enumerate(["FF5F56", "FFBD2E", "27C93F"]):
         shape(s, MSO_SHAPE.OVAL, 0.25 + k * 0.3, 0.15, 0.2, 0.2, col)
-    text(s, 1.4, 0.08, 8, 0.35, f"~/{BOT_TAG.lstrip('@')} $ python slides.py", 12, "8B949E", font="Consolas")
+    text(s, 1.4, 0.08, 8, 0.35, "~/taqdimot $ python slides.py", 12, "8B949E", font="Consolas")
     if kind == "title":
         text(s, 8.6, 1.4, 4.7, 3.4, "</>", 130, "12303B", True, "Consolas", PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
         rect(s, 0.8, 1.9, 0.1, 2.9, th["accent"])
@@ -213,7 +213,6 @@ def fit_size(items, width_in, height_pt, sizes=(24, 22, 20, 19, 18, 17, 16, 15, 
 
 
 def footer(s, n, th):
-    text(s, 0.9, 7.05, 4, 0.3, BOT_TAG, 11, th["muted"], font=th["fb"])
     if n:
         text(s, 11.8, 7.0, 1.0, 0.35, str(n), 13, th["muted"], font=th["fb"], align=PP_ALIGN.RIGHT)
 
@@ -318,15 +317,9 @@ def thanks_slide(prs, th, lang):
     s = prs.slides.add_slide(prs.slide_layouts[6])
     th["decor"](s, "title", 1, th)
     lab = LABELS[lang]
-    text(s, 0.9, 1.5, 11.5, 1.3, lab["thanks"], 44, th["on_dark"], True, th["ft"], PP_ALIGN.CENTER,
+    text(s, 0.9, 2.3, 11.5, 1.6, lab["thanks"], 48, th["on_dark"], True, th["ft"], PP_ALIGN.CENTER,
          MSO_ANCHOR.MIDDLE)
-    text(s, 0.9, 2.9, 11.5, 0.7, lab["q"], 26, th["sub"], font=th["fb"], align=PP_ALIGN.CENTER)
-    shape(s, MSO_SHAPE.ROUNDED_RECTANGLE, 1.6, 3.95, 10.1, 1.8, th["accent"])
-    text(s, 1.8, 4.0, 9.7, 0.8, f"★  Bu taqdimot {BOT_TAG} boti yordamida tayyorlandi", 24, th["on_accent"],
-         True, th["fb"], PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
-    text(s, 1.8, 4.8, 9.7, 0.8,
-         f"Slayd, mustaqil ish va obyektivkani 1 daqiqada tayyorlang — Telegram’da {BOT_TAG}", 18,
-         th["on_accent"], False, th["fb"], PP_ALIGN.CENTER, MSO_ANCHOR.MIDDLE)
+    text(s, 0.9, 4.1, 11.5, 0.8, lab["q"], 28, th["sub"], font=th["fb"], align=PP_ALIGN.CENTER)
     return s
 
 

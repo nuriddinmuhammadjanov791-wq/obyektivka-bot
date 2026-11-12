@@ -107,3 +107,35 @@ async def fetch_all(queries, ratio):
 
     async with httpx.AsyncClient(timeout=15, headers=UA, follow_redirects=True) as c:
         return await asyncio.gather(*[one(c, q) for q in queries])
+
+
+# ---------------- Rasm -> PDF ----------------
+def shrink(raw: bytes):
+    """Yuborilgan rasmni (foto yoki fayl) yengil JPEG'ga aylantiradi. Ochilmasa None."""
+    from PIL import Image, ImageOps
+
+    try:
+        im = ImageOps.exif_transpose(Image.open(io.BytesIO(raw))).convert("RGB")
+    except Exception:
+        return None
+    im.thumbnail((2000, 2000))
+    out = io.BytesIO()
+    im.save(out, "JPEG", quality=88)
+    return out.getvalue()
+
+
+def make_pdf(jpegs, out_path):
+    """Har bir rasm — alohida A4 sahifa (yo'nalishi rasmga qarab tanlanadi)."""
+    from PIL import Image, ImageOps
+
+    A4 = (1075, 1520)  # ~130 dpi
+    pages = []
+    for b in jpegs:
+        im = Image.open(io.BytesIO(b)).convert("RGB")
+        size = A4 if im.height >= im.width else (A4[1], A4[0])
+        im = ImageOps.contain(im, (size[0] - 60, size[1] - 60))
+        page = Image.new("RGB", size, "white")
+        page.paste(im, ((size[0] - im.width) // 2, (size[1] - im.height) // 2))
+        pages.append(page)
+    pages[0].save(out_path, "PDF", resolution=130.0, save_all=True, append_images=pages[1:])
+    return out_path

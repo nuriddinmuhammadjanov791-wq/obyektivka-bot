@@ -3,11 +3,16 @@ Obyektivka (ma'lumotnoma) Telegram boti.
 Savollarni birin-ketin so'raydi, oxirida hammasini ko'rsatib, tahrirlash imkonini beradi
 va tayyor Word (.docx) fayl yuboradi.
 """
+import asyncio
 import datetime
+import html
+import io
 import logging
 import os
+import random
 import re
 import tempfile
+import zipfile
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -21,7 +26,8 @@ from telegram.ext import (
 
 import ai
 from docgen import build_docx
-from paper import build_paper
+import crossword
+import paper
 import images
 from slides import BOT_TAG, IMG_RATIO, THEME_OPTIONS, build_pptx
 
@@ -63,36 +69,130 @@ WORK_HELP = (
     "Hozirgi o‘qishingiz o‘zi avtomatik qo‘shiladi."
 )
 
-MENU_KB = InlineKeyboardMarkup([
-    [InlineKeyboardButton("📄 Obyektivka tayyorlash", callback_data="m:obyektivka")],
-    [InlineKeyboardButton("📊 Slayd tayyorlash", callback_data="m:slayd")],
-    [InlineKeyboardButton("📝 Mustaqil ish tayyorlash", callback_data="m:mustaqil")],
-    [InlineKeyboardButton("📞 Admin bilan bog‘lanish", callback_data="m:contact")],
-])
+def _kb(*rows):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(t, callback_data=d) for t, d in row] for row in rows])
+
+
+MENU_KB = _kb(
+    [("📄 Obyektivka tayyorlash", "m:obyektivka")],
+    [("📊 Slayd tayyorlash", "m:slayd")],
+    [("📝 Mustaqil ish / Referat", "m:mustaqil")],
+    [("📚 Boshqa hujjatlar", "m:docs"), ("🧰 O‘quv materiallari", "m:edu")],
+    [("🖼 Rasmni PDF qilish", "m:pdf"), ("🗜 ZIP qilish", "m:zip")],
+    [("🤖 AI yordamchi (savol-javob)", "m:ai")],
+    [("📞 Admin bilan bog‘lanish", "m:contact")],
+)
+AI_KB = _kb([("🧹 Yangi suhbat", "ai:new"), ("🏠 Menyu", "m:menu")])
+CHAT_LIMIT = int(os.getenv("CHAT_LIMIT", "20"))
+CHAT_USAGE = {}  # user_id -> (sana, soni)
+DOCS_KB = _kb(
+    [("🎓 Kurs ishi", "m:kurs"), ("✍️ Insho", "m:insho")],
+    [("📰 Ilmiy maqola", "m:maqola"), ("📄 Tezis", "m:tezis")],
+    [("💼 Keys (case study)", "m:keys")],
+    [("🏠 Menyu", "m:menu")],
+)
+EDU_KB = _kb(
+    [("📝 Test yaratish", "m:test"), ("📖 Glossariy", "m:glossariy")],
+    [("🧩 Krossvord", "m:krossvord")],
+    [("🏠 Menyu", "m:menu")],
+)
+PDF_KB = _kb([("✅ PDF qilish", "pdf:make"), ("🗑 Tozalash", "pdf:clear")], [("🏠 Menyu", "m:menu")])
+ZIP_KB = _kb([("✅ ZIP qilish", "zip:make"), ("🗑 Tozalash", "zip:clear")], [("🏠 Menyu", "m:menu")])
+MAX_PDF = 20
+MAX_ZIP_FILES, MAX_ZIP_BYTES = 30, 45 * 1024 * 1024
 MENU_BTN = InlineKeyboardButton("🏠 Menyu", callback_data="m:menu")
 MENU_TEXT = "Assalomu alaykum! 👋 Nimani tayyorlab beray?"
 
 LANGS = [("🇺🇿 O‘zbekcha", "uz"), ("🇷🇺 Русский", "ru"), ("🇬🇧 English", "en")]
 # forma: (kalit, savol, variantlar yoki None)
+def _nums(*vals):
+    return [(str(v), str(v)) for v in vals]
+
+
+AUTHOR_Q = "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh"
 FORMS = {
     "slayd": [
         ("topic", "Taqdimot mavzusi nima?", None),
         ("subject", "Fan nomi? (sarlavha slaydida chiqadi; kerak bo‘lmasa «-» yozing)", None),
         ("lang", "Qaysi tilda bo‘lsin?", LANGS),
-        ("count", "Jami nechta slayd kerak? (sarlavha, reja va yakuniy sahifa ham kiradi)",
-         [(str(n), str(n)) for n in (8, 10, 12, 15, 20)]),
+        ("count", "Jami nechta slayd kerak? (sarlavha, reja va yakuniy sahifa ham kiradi)", _nums(8, 10, 12, 15, 20)),
         ("theme", "Slayd uslubini (shablonini) tanlang:", THEME_OPTIONS),
-        ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
+        ("author", AUTHOR_Q, None),
     ],
     "mustaqil": [
         ("subject", "Fan nomi?", None),
-        ("topic", "Mustaqil ish mavzusi?", None),
+        ("topic", "Mavzu?", None),
+        ("doc", "Hujjat turi?", [("📘 Referat", "referat"), ("📝 Mustaqil ish", "mustaqil")]),
         ("lang", "Qaysi tilda bo‘lsin?", LANGS),
-        ("pages", "Taxminan necha bet kerak?", [(str(n), str(n)) for n in (5, 8, 10, 15, 20)]),
-        ("author", "Muallif (ism-familiya va guruh)?\nMasalan: Ali Valiyev, 101-guruh", None),
+        ("pages", "Taxminan necha bet kerak?", _nums(5, 8, 10, 15, 20)),
+        ("author", AUTHOR_Q, None),
         ("univ", "Universitet nomi? (titul varag‘ida chiqadi)", None),
+        ("faculty", "Fakultet va yo‘nalish? Kerak bo‘lmasa «-» yozing", None),
         ("teacher", "Qabul qiluvchi o‘qituvchi (F.I.Sh.)? Kerak bo‘lmasa «-» yozing", None),
+        ("city", "Shahar? (titulda «Toshkent – 2026» ko‘rinishida chiqadi; kerak bo‘lmasa «-»)", None),
     ],
+    "kurs": [
+        ("subject", "Fan nomi?", None),
+        ("topic", "Kurs ishi mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("pages", "Taxminan necha bet kerak?", _nums(20, 25, 30, 40)),
+        ("author", AUTHOR_Q, None),
+        ("univ", "Universitet nomi?", None),
+        ("faculty", "Fakultet va yo‘nalish? Kerak bo‘lmasa «-» yozing", None),
+        ("teacher", "Ilmiy rahbar (F.I.Sh.)? Kerak bo‘lmasa «-» yozing", None),
+        ("city", "Shahar? (kerak bo‘lmasa «-»)", None),
+    ],
+    "insho": [
+        ("topic", "Insho mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("words", "Necha so‘z atrofida bo‘lsin?", _nums(300, 500, 800, 1000)),
+        ("style", "Uslub?", [("🎓 Ilmiy-rasmiy", "formal"), ("🎨 Erkin", "free")]),
+        ("author", "Muallif (F.I.Sh.)? Kerak bo‘lmasa «-» yozing", None),
+    ],
+    "maqola": [
+        ("topic", "Maqola mavzusi?", None),
+        ("field", "Ilmiy soha? (masalan: ekologiya, iqtisodiyot, pedagogika)", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("pages", "Necha bet?", _nums(3, 4, 5, 6)),
+        ("author", "Muallif (F.I.Sh.)?", None),
+        ("workplace", "Ish yoki o‘qish joyi (masalan: TDTU, 2-kurs talabasi)?", None),
+    ],
+    "tezis": [
+        ("topic", "Tezis mavzusi?", None),
+        ("field", "Ilmiy soha?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("author", "Muallif (F.I.Sh.)?", None),
+        ("workplace", "Ish yoki o‘qish joyi (masalan: TDTU, 2-kurs talabasi)?", None),
+    ],
+    "keys": [
+        ("subject", "Fan nomi?", None),
+        ("topic", "Keys mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("author", "Tayyorlovchi (F.I.Sh.)? Kerak bo‘lmasa «-» yozing", None),
+    ],
+    "test": [
+        ("subject", "Fan nomi?", None),
+        ("topic", "Test mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("count", "Nechta savol?", _nums(10, 20, 30, 50)),
+        ("level", "Murakkablik darajasi?", [("🟢 Oson", "easy"), ("🟡 O‘rta", "mid"), ("🔴 Murakkab", "hard")]),
+    ],
+    "glossariy": [
+        ("subject", "Fan nomi?", None),
+        ("topic", "Mavzu?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("count", "Nechta atama?", _nums(15, 25, 40)),
+    ],
+    "krossvord": [
+        ("topic", "Krossvord mavzusi?", None),
+        ("lang", "Qaysi tilda bo‘lsin?", LANGS),
+        ("count", "Nechta so‘z?", _nums(10, 15, 20)),
+    ],
+}
+FORM_TITLES = {
+    "slayd": "📊 Slayd", "mustaqil": "📝 Mustaqil ish / Referat", "kurs": "🎓 Kurs ishi", "insho": "✍️ Insho",
+    "maqola": "📰 Ilmiy maqola", "tezis": "📄 Tezis", "keys": "💼 Keys", "test": "📝 Test",
+    "glossariy": "📖 Glossariy", "krossvord": "🧩 Krossvord",
 }
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "3"))
 USAGE = {}  # user_id -> (sana, soni)
@@ -124,7 +224,7 @@ THANKS = (
     "Botdan foydalanganingiz uchun rahmat! 🙏\n\n"
     "Rahmatni ikki xil aytsangiz bo‘ladi 😁\n"
     "💳 <code>5614688708547111</code> N.M orqali 😅\n"
-    "✍️ yoki adminga ga samimiy yozib qo‘yish orqali 😊"
+    "✍️ yoki @nuriddin26 ga samimiy yozib qo‘yish orqali 😊"
 )
 
 BTN_DONE_WORK = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tayyor", callback_data="work_done")]])
@@ -236,9 +336,166 @@ async def ask_field(msg, ud, prefix=""):
 async def begin_form(msg, ud, name):
     ud.clear()
     ud.update(step="form", form=name, fi=0, fdata={}, busy=False)
-    title = "📊 Slayd" if name == "slayd" else "📝 Mustaqil ish"
-    await msg.reply_text(f"{title} tayyorlaymiz. Bir necha savol beraman. (Orqaga: /orqaga, menyu: /menu)")
+    await msg.reply_text(f"{FORM_TITLES[name]} tayyorlaymiz. Bir necha savol beraman. "
+                         "(Orqaga: /orqaga, menyu: /menu)")
     await ask_field(msg, ud)
+
+
+async def begin_pdf(msg, ud):
+    ud.clear()
+    ud.update(step="pdf", pics=[], busy=False, last_group=None)
+    await ask(msg, ud,
+              f"🖼 Rasmlarni yuboring (bir yoki bir nechta, ko‘pi bilan {MAX_PDF} ta). Hujjat yoki konspekt "
+              "bo‘lsa, 📎 → Fayl orqali yuborsangiz sifati yaxshi bo‘ladi. Hammasi yuborilgach «PDF qilish» ni bosing. "
+              "Sahifalar yuborilgan tartibda joylashadi.",
+              InlineKeyboardMarkup([[MENU_BTN]]))
+
+
+async def add_pdf_image(msg, ud, tg_file, group):
+    first = group is None or ud.get("last_group") != group
+    ud["last_group"] = group
+    if len(ud["pics"]) >= MAX_PDF:
+        if first:
+            await msg.reply_text(f"Ko‘pi bilan {MAX_PDF} ta rasm. «PDF qilish» ni bosing.", reply_markup=PDF_KB)
+        return
+    raw = await tg_file.download_as_bytearray()
+    data = images.shrink(bytes(raw))
+    if data is None:
+        await msg.reply_text("Bu rasmni ochib bo‘lmadi (JPG yoki PNG yuboring).")
+        return
+    ud["pics"].append((msg.message_id, data))
+    if not first:
+        return  # albom: har bir rasm uchun alohida javob bermaymiz
+    await drop_kb(ud)
+    await ask(msg, ud, "📷 Qabul qilindi. Yana yuboring yoki PDF qiling "
+                       "(albom yuborgan bo‘lsangiz, hammasi qo‘shiladi):", PDF_KB)
+
+
+def md_to_html(t):
+    """Gemini'ning markdown javobini Telegram HTML'ga aylantiradi."""
+    t = html.escape(t, quote=False)
+    t = re.sub(r"```(?:\w+)?\n?(.*?)```", lambda m: "<pre>" + m.group(1) + "</pre>", t, flags=re.S)
+    t = re.sub(r"`([^`\n]+)`", r"<code>\1</code>", t)
+    t = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", t, flags=re.S)
+    t = re.sub(r"(?m)^#{1,6}\s*(.+)$", r"<b>\1</b>", t)
+    t = re.sub(r"(?m)^\s*[\*\-]\s+", "• ", t)
+    return t
+
+
+def split_text(t, size=3800):
+    parts = []
+    while len(t) > size:
+        cut = t.rfind("\n\n", 0, size)
+        if cut < size // 2:
+            cut = t.rfind("\n", 0, size)
+        if cut < size // 2:
+            cut = size
+        parts.append(t[:cut].strip())
+        t = t[cut:].strip()
+    if t:
+        parts.append(t)
+    return parts
+
+
+def chat_left(uid):
+    if is_admin(uid):
+        return 999
+    day = datetime.date.today().isoformat()
+    d, n = CHAT_USAGE.get(uid, (day, 0))
+    return CHAT_LIMIT - (n if d == day else 0)
+
+
+def chat_use(uid):
+    day = datetime.date.today().isoformat()
+    d, n = CHAT_USAGE.get(uid, (day, 0))
+    CHAT_USAGE[uid] = (day, (n if d == day else 0) + 1)
+
+
+async def begin_ai(msg, ud):
+    ud.clear()
+    ud.update(step="ai", hist=[], busy=False)
+    await ask(msg, ud,
+              "🤖 Men AI yordamchiman. Istalgan savolingizni yozing: dars mavzusini tushuntirish, tarjima, "
+              f"g‘oya, maslahat. Har kuni {CHAT_LIMIT} tagacha xabar. Mavzuni almashtirmoqchi bo‘lsangiz, "
+              "«🧹 Yangi suhbat» ni bosing.", AI_KB)
+
+
+async def ai_answer(msg, ctx, ud, user, text):
+    if chat_left(user.id) <= 0:
+        await msg.reply_text(f"Bugungi limit ({CHAT_LIMIT} ta xabar) tugadi. Ertaga davom etamiz 🙂", reply_markup=MENU_KB)
+        ud.clear()
+        return
+    ud["busy"] = True
+    try:
+        try:
+            await ctx.bot.send_chat_action(msg.chat_id, "typing")
+        except Exception:
+            pass
+        answer = await ai.chat(ud["hist"], text)
+        chat_use(user.id)
+        ud["hist"] += [{"role": "user", "text": text}, {"role": "model", "text": answer}]
+        ud["hist"] = ud["hist"][-12:]
+        chunks = split_text(answer)
+        sent = None
+        for i, ch in enumerate(chunks):
+            kb = AI_KB if i == len(chunks) - 1 else None
+            try:
+                sent = await msg.reply_text(md_to_html(ch), parse_mode="HTML", reply_markup=kb)
+            except Exception:
+                sent = await msg.reply_text(ch, reply_markup=kb)
+        ud["last_q"] = sent
+    except ai.AIError as e:
+        logging.warning("AI chat xato: %s", e)
+        txt = ("Hozir juda ko‘p so‘rov bor, 1 daqiqadan keyin qayta yozing."
+               if str(e) == "busy" else "Javob olishda xato chiqdi. Qayta urinib ko‘ring.")
+        await msg.reply_text(txt, reply_markup=AI_KB)
+    except Exception:
+        logging.exception("AI chat xatosi")
+        await msg.reply_text("Kutilmagan xato. Qayta urinib ko‘ring.", reply_markup=AI_KB)
+    finally:
+        ud["busy"] = False
+
+
+async def begin_zip(msg, ud):
+    ud.clear()
+    ud.update(step="zip", files=[], size=0, busy=False, last_group=None)
+    await ask(msg, ud,
+              f"🗜 Fayllarni yuboring (hujjat, rasm, video — ko‘pi bilan {MAX_ZIP_FILES} ta, jami 45 MB gacha; "
+              "Telegram har bir faylni 20 MB gacha yuklab olishga ruxsat beradi). "
+              "Hammasi yuborilgach «ZIP qilish» ni bosing.",
+              InlineKeyboardMarkup([[MENU_BTN]]))
+
+
+async def add_zip_file(msg, ud, tg_file, name, group):
+    first = group is None or ud.get("last_group") != group
+    ud["last_group"] = group
+    if len(ud["files"]) >= MAX_ZIP_FILES or ud["size"] >= MAX_ZIP_BYTES:
+        if first:
+            await msg.reply_text("Limitga yetdi. «ZIP qilish» ni bosing.", reply_markup=ZIP_KB)
+        return
+    try:
+        raw = bytes(await tg_file.download_as_bytearray())
+    except Exception:
+        await msg.reply_text("Bu faylni yuklab bo‘lmadi (20 MB dan katta bo‘lishi mumkin).")
+        return
+    if ud["size"] + len(raw) > MAX_ZIP_BYTES:
+        await msg.reply_text("Jami hajm 45 MB dan oshib ketadi, bu fayl qo‘shilmadi.", reply_markup=ZIP_KB)
+        return
+    used = {n for n, _ in ud["files"]}
+    base, dot, ext = name.rpartition(".")
+    if not dot:
+        base, ext = name, ""
+    k, final = 1, name
+    while final in used:
+        k += 1
+        final = f"{base} ({k}).{ext}" if ext else f"{base} ({k})"
+    ud["files"].append((final, raw))
+    ud["size"] += len(raw)
+    if not first:
+        return
+    await drop_kb(ud)
+    await ask(msg, ud, "📎 Qabul qilindi. Yana yuboring yoki ZIP qiling "
+                       "(bir nechta fayl yuborgan bo‘lsangiz, hammasi qo‘shiladi):", ZIP_KB)
 
 
 async def begin_contact(msg, ud):
@@ -246,6 +503,84 @@ async def begin_contact(msg, ud):
     ud["step"] = "contact"
     await ask(msg, ud, "📞 Xabaringizni yozing, adminga yetkazaman. Admin javobi shu yerga keladi.",
               InlineKeyboardMarkup([[MENU_BTN]]))
+
+
+WAIT_TEXT = {
+    "slayd": "2-3 daqiqa (matn va rasmlar tayyorlanmoqda)",
+    "mustaqil": "3-5 daqiqa (uzun ish bo‘limma-bo‘lim yoziladi)",
+    "kurs": "5-8 daqiqa (kurs ishi bo‘limma-bo‘lim yoziladi)",
+    "maqola": "2-3 daqiqa", "tezis": "1-2 daqiqa", "insho": "1-2 daqiqa", "keys": "1-2 daqiqa",
+    "test": "1-3 daqiqa", "glossariy": "1-2 daqiqa", "krossvord": "1-2 daqiqa",
+}
+AI_NOTE = ("Matn sun’iy intellekt yordamida yozilgan: faktlar, havolalar va adabiyotlar ro‘yxatini albatta "
+           "tekshirib, o‘zingizga moslab tahrirlang.")
+
+
+async def build_output(form, d, uid):
+    """Tanlangan imkoniyat bo'yicha fayl yaratadi. (yo'l, fayl nomi, izoh) qaytaradi."""
+    tmp = tempfile.gettempdir()
+    if form == "slayd":
+        n = int(d["count"])
+        slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 3)
+        pics = await images.fetch_all([x.get("image_query", "") for x in slides], IMG_RATIO)
+        for x, p in zip(slides, pics):
+            x["img"] = p
+        out = os.path.join(tmp, f"slayd_{uid}.pptx")
+        build_pptx(d["topic"], d["subject"], d["author"], slides, out, d["theme"], d["lang"])
+        return out, "Taqdimot.pptx", ("Tayyor! ✅ Har bir slaydning izohi (notes) ham bor. Matnni o‘qib chiqing, "
+                                      "kerak bo‘lsa PowerPoint’da tahrirlang.")
+    if form in ("mustaqil", "kurs"):
+        kind = "kurs" if form == "kurs" else d["doc"]
+        text = await ai.write_document(kind, d["subject"], d["topic"], d["lang"], int(d["pages"]))
+        out = os.path.join(tmp, f"ish_{uid}.docx")
+        paper.build_paper(d, text, out, kind)
+        names = {"mustaqil": "Mustaqil_ish.docx", "referat": "Referat.docx", "kurs": "Kurs_ishi.docx"}
+        return out, names[kind], "Tayyor! ✅ Talab: A4, Times New Roman 14, 1,5 interval, chap 30/o‘ng 15/yuqori-past 20 mm. " + AI_NOTE
+    if form == "maqola":
+        text, ann = await asyncio.gather(
+            ai.write_document("maqola", d["field"], d["topic"], d["lang"], int(d["pages"])),
+            ai.make_annotations(d["topic"], d["field"], d["lang"]))
+        out = os.path.join(tmp, f"maqola_{uid}.docx")
+        paper.build_article(d, ann, text, out)
+        return out, "Ilmiy_maqola.docx", ("Tayyor! ✅ Muallif o‘ngda, sarlavha o‘rtada, 3 tilda annotatsiya, "
+                                          "har tomondan 20 mm. UO‘K indeksini o‘zingiz qo‘shing. " + AI_NOTE)
+    if form == "tezis":
+        text = await ai.make_tezis(d["topic"], d["field"], d["lang"])
+        out = os.path.join(tmp, f"tezis_{uid}.docx")
+        paper.build_tezis(d, None, text, out)
+        return out, "Tezis.docx", "Tayyor! ✅ " + AI_NOTE
+    if form == "insho":
+        text = await ai.make_insho(d["topic"], d["lang"], int(d["words"]), d["style"])
+        out = os.path.join(tmp, f"insho_{uid}.docx")
+        paper.build_insho(d, text, out)
+        return out, "Insho.docx", "Tayyor! ✅ O‘qib chiqib, o‘z uslubingizga moslang."
+    if form == "keys":
+        text = await ai.make_keys(d["subject"], d["topic"], d["lang"])
+        out = os.path.join(tmp, f"keys_{uid}.docx")
+        paper.build_keys(d, text, out)
+        return out, "Keys.docx", "Tayyor! ✅ " + AI_NOTE
+    if form == "test":
+        qs = await ai.make_test(d["subject"], d["topic"], d["lang"], int(d["count"]), d["level"])
+        items = []
+        for q in qs:
+            opts = [q["correct"]] + q["wrong"]
+            random.shuffle(opts)
+            items.append({"q": q["q"], "options": opts, "answer": "ABCD"[opts.index(q["correct"])]})
+        out = os.path.join(tmp, f"test_{uid}.docx")
+        paper.build_test(d, items, out)
+        return out, "Test.docx", f"Tayyor! ✅ {len(items)} ta savol, oxirida javoblar kaliti. Savollarni tekshirib chiqing."
+    if form == "glossariy":
+        terms = await ai.make_glossary(d["subject"], d["topic"], d["lang"], int(d["count"]))
+        out = os.path.join(tmp, f"glos_{uid}.docx")
+        paper.build_glossary(d, terms, out)
+        return out, "Glossariy.docx", f"Tayyor! ✅ {len(terms)} ta atama, alifbo tartibida."
+    if form == "krossvord":
+        items = await ai.make_crossword_words(d["topic"], d["lang"], int(d["count"]))
+        g = crossword.build_grid(items, int(d["count"]))
+        out = os.path.join(tmp, f"kross_{uid}.docx")
+        paper.build_crossword(d, g, out)
+        return out, "Krossvord.docx", f"Tayyor! ✅ {g['count']} ta so‘z joylashdi. 2-sahifada javoblar bor."
+    raise ValueError(form)
 
 
 async def finish_form(msg, ctx, ud, user):
@@ -256,31 +591,13 @@ async def finish_form(msg, ctx, ud, user):
             reply_markup=MENU_KB)
         ud.clear()
         return
-    d = ud["fdata"]
-    form = ud["form"]
+    d, form = ud["fdata"], ud["form"]
     ud["busy"] = True
-    await msg.reply_text("⏳ Tayyorlanmoqda, 2-3 daqiqa kuting (matn va rasmlar tayyorlanmoqda)…")
+    await msg.reply_text(f"⏳ Tayyorlanmoqda, {WAIT_TEXT.get(form, '1-3 daqiqa')} kuting…")
     try:
-        if form == "slayd":
-            n = int(d["count"])
-            slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 3)
-            pics = await images.fetch_all([x.get("image_query", "") for x in slides], IMG_RATIO)
-            for x, p in zip(slides, pics):
-                x["img"] = p
-            out = os.path.join(tempfile.gettempdir(), f"slayd_{uid}.pptx")
-            build_pptx(d["topic"], d["subject"], d["author"], slides, out, d["theme"], d["lang"])
-            fname = "Taqdimot.pptx"
-            caption = ("Tayyor! ✅ Har bir slaydning izohi (notes) ham bor. Matnni o‘qib chiqing, kerak bo‘lsa "
-                       "PowerPoint’da tahrirlang.\n\n" + PROMO)
-        else:
-            text = await ai.make_paper(d["subject"], d["topic"], d["lang"], int(d["pages"]))
-            out = os.path.join(tempfile.gettempdir(), f"ish_{uid}.docx")
-            build_paper(d, text, out)
-            fname = "Mustaqil_ish.docx"
-            caption = ("Tayyor! ✅ Matn sun’iy intellekt yordamida yozilgan: faktlar va adabiyotlar "
-                       "ro‘yxatini albatta tekshirib, o‘zingizga moslab tahrirlang.\n\n" + PROMO)
+        out, fname, caption = await build_output(form, d, uid)
         with open(out, "rb") as fh:
-            await msg.reply_document(fh, filename=fname, caption=caption)
+            await msg.reply_document(fh, filename=fname, caption=caption + "\n\n" + PROMO)
         quota_use(uid)
         await msg.reply_text(THANKS, parse_mode="HTML")
         await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
@@ -411,6 +728,10 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ud.clear()
         return
 
+    if step == "ai":
+        await ai_answer(msg, ctx, ud, user, text)
+        return
+
     if step == "form":
         opts = FORMS[ud["form"]][ud["fi"]][2]
         if opts:
@@ -472,19 +793,65 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ud = ctx.user_data
-    if ud.get("step") != "photo":
+    msg = update.message
+    if not ud.get("step"):  # menyuda turib rasm yuborsa — PDF rejimini o'zi boshlaymiz
+        await begin_pdf(msg, ud)
+    step = ud.get("step")
+    if step == "pdf":
+        f = await msg.photo[-1].get_file()
+        await add_pdf_image(msg, ud, f, msg.media_group_id)
+        return
+    if step == "zip":
+        f = await msg.photo[-1].get_file()
+        await add_zip_file(msg, ud, f, f"rasm_{msg.message_id}.jpg", msg.media_group_id)
+        return
+    if step != "photo":
         return
     await drop_kb(ud)
-    f = await update.message.photo[-1].get_file()
+    f = await msg.photo[-1].get_file()
     path = os.path.join(tempfile.gettempdir(), f"photo_{update.effective_user.id}.jpg")
     await f.download_to_drive(path)
     ud["photo"] = path
-    await update.message.reply_text("Rasm qabul qilindi ✅")
+    await msg.reply_text("Rasm qabul qilindi ✅")
     if ud["from_review"]:
-        await show_review(update.message, ud)
+        await show_review(msg, ud)
     else:
         ud["step"] = "work"
-        await ask(update.message, ud, WORK_HELP)
+        await ask(msg, ud, WORK_HELP)
+
+
+async def on_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Fayl sifatida yuborilgan hujjat/rasm."""
+    ud = ctx.user_data
+    msg = update.message
+    doc = msg.document
+    is_img = (doc.mime_type or "").startswith("image/")
+    if not ud.get("step"):
+        if is_img:
+            await begin_pdf(msg, ud)
+        else:
+            await msg.reply_text("Faylni ZIP qilmoqchimisiz? Menyudan «🗜 ZIP qilish» ni tanlang.", reply_markup=MENU_KB)
+            return
+    step = ud.get("step")
+    if step == "pdf":
+        if not is_img:
+            await msg.reply_text("PDF uchun faqat rasm yuboring (JPG/PNG).")
+            return
+        await add_pdf_image(msg, ud, await doc.get_file(), msg.media_group_id)
+    elif step == "zip":
+        await add_zip_file(msg, ud, await doc.get_file(), doc.file_name or f"fayl_{msg.message_id}",
+                           msg.media_group_id)
+
+
+async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Video/audio — faqat ZIP rejimida."""
+    ud = ctx.user_data
+    msg = update.message
+    if ud.get("step") != "zip":
+        return
+    m = msg.video or msg.audio
+    name = getattr(m, "file_name", None) or f"{'video' if msg.video else 'audio'}_{msg.message_id}"
+    await add_zip_file(msg, ud, await m.get_file(), name, msg.media_group_id)
 
 
 # ---------- Tugmalar ----------
@@ -501,8 +868,20 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         what = data[2:]
         if what == "obyektivka":
             await begin_obyektivka(msg, ctx)
-        elif what in ("slayd", "mustaqil"):
+        elif what in FORMS:
             await begin_form(msg, ud, what)
+        elif what == "docs":
+            ud.clear()
+            await msg.reply_text("📚 Qaysi hujjatni tayyorlaymiz?", reply_markup=DOCS_KB)
+        elif what == "edu":
+            ud.clear()
+            await msg.reply_text("🧰 Qaysi o‘quv materialini tayyorlaymiz?", reply_markup=EDU_KB)
+        elif what == "pdf":
+            await begin_pdf(msg, ud)
+        elif what == "zip":
+            await begin_zip(msg, ud)
+        elif what == "ai":
+            await begin_ai(msg, ud)
         elif what == "contact":
             await begin_contact(msg, ud)
         else:
@@ -544,6 +923,57 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     elif data == "rel_done" and step == "relative_menu":
         await show_review(msg, ud)
+
+    elif step == "ai":
+        if data == "ai:new":
+            ud["hist"] = []
+            await ask(msg, ud, "Yangi suhbat boshlandi. Savolingizni yozing.", AI_KB)
+
+    elif step == "zip":
+        if data == "zip:clear":
+            ud["files"], ud["size"], ud["last_group"] = [], 0, None
+            await ask(msg, ud, "Tozalandi. Yangi fayllarni yuboring.", InlineKeyboardMarkup([[MENU_BTN]]))
+        elif data == "zip:make":
+            if not ud["files"]:
+                await msg.reply_text("Avval fayl yuboring.")
+                return
+            ud["busy"] = True
+            await msg.reply_text("⏳ ZIP tayyorlanmoqda…")
+            try:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    for name, raw in ud["files"]:
+                        zf.writestr(name, raw)
+                await msg.reply_document(buf.getvalue(), filename="Fayllar.zip",
+                                         caption=f"Tayyor! ✅ {len(ud['files'])} ta fayl.\n\n" + PROMO)
+                await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
+            except Exception:
+                logging.exception("ZIP xatosi")
+                await msg.reply_text("ZIP tayyorlashda xato chiqdi.", reply_markup=MENU_KB)
+            ud.clear()
+
+    elif step == "pdf":
+        if data == "pdf:clear":
+            ud["pics"], ud["last_group"] = [], None
+            await ask(msg, ud, "Tozalandi. Yangi rasmlarni yuboring.", InlineKeyboardMarkup([[MENU_BTN]]))
+        elif data == "pdf:make":
+            if not ud["pics"]:
+                await msg.reply_text("Avval rasm yuboring.")
+                return
+            ud["busy"] = True
+            await msg.reply_text("⏳ PDF tayyorlanmoqda…")
+            try:
+                pics = [b for _, b in sorted(ud["pics"], key=lambda x: x[0])]
+                out = os.path.join(tempfile.gettempdir(), f"rasm_{q.from_user.id}.pdf")
+                images.make_pdf(pics, out)
+                with open(out, "rb") as fh:
+                    await msg.reply_document(fh, filename="Rasmlar.pdf",
+                                             caption=f"Tayyor! ✅ {len(pics)} sahifa.\n\n" + PROMO)
+                await msg.reply_text("Yana nima kerak?", reply_markup=MENU_KB)
+            except Exception:
+                logging.exception("PDF xatosi")
+                await msg.reply_text("PDF tayyorlashda xato chiqdi. Qayta urinib ko‘ring.", reply_markup=MENU_KB)
+            ud.clear()
 
     elif step == "review":
         if data.startswith("e:"):
@@ -598,6 +1028,8 @@ def main():
     app.add_handler(CommandHandler("orqaga", back))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_doc))
+    app.add_handler(MessageHandler(filters.VIDEO | filters.AUDIO, on_media))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
 
     base_url = os.getenv("RENDER_EXTERNAL_URL")
