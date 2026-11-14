@@ -28,6 +28,7 @@ from telegram.ext import (
 
 import ai
 from store import store
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from docgen import build_docx
 import crossword
 import paper
@@ -88,7 +89,6 @@ MENU_KB = _kb(
 )
 AI_KB = _kb([("🧹 Yangi suhbat", "ai:new"), ("🏠 Menyu", "m:menu")])
 CHAT_LIMIT = int(os.getenv("CHAT_LIMIT", "20"))
-CHAT_USAGE = {}  # user_id -> (sana, soni)
 DOCS_KB = _kb(
     [("🎓 Kurs ishi", "m:kurs"), ("✍️ Insho", "m:insho")],
     [("📰 Ilmiy maqola", "m:maqola"), ("📄 Tezis", "m:tezis")],
@@ -212,7 +212,6 @@ FORM_TITLES = {
     "glossariy": "📖 Glossariy", "krossvord": "🧩 Krossvord",
 }
 DAILY_LIMIT = int(os.getenv("DAILY_LIMIT", "3"))
-USAGE = {}  # user_id -> (sana, soni)
 
 
 def is_admin(uid):
@@ -259,7 +258,7 @@ def allowed(uid, kind="msg"):
 
 async def guard(user, msg, kind="msg"):
     """Foydalanuvchini hisobga oladi va juda tez yozayotganini to'xtatadi."""
-    store.touch(user)
+    await store.seen(user)
     if allowed(user.id, kind):
         return True
     now = time.monotonic()
@@ -283,17 +282,11 @@ async def notify_admin(ctx, text):
 
 
 def quota_left(uid):
-    if is_admin(uid):
-        return 999
-    day = datetime.date.today().isoformat()
-    d, n = USAGE.get(uid, (day, 0))
-    return DAILY_LIMIT - (n if d == day else 0)
+    return 999 if is_admin(uid) else DAILY_LIMIT - store.used(uid, "doc")
 
 
 def quota_use(uid):
-    day = datetime.date.today().isoformat()
-    d, n = USAGE.get(uid, (day, 0))
-    USAGE[uid] = (day, (n if d == day else 0) + 1)
+    store.add_used(uid, "doc")
 
 
 PROMO = (f"✨ {BOT_TAG} — slayd, mustaqil ish va obyektivkani bir daqiqada tayyorlaydigan bot. "
@@ -407,17 +400,96 @@ async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(HELP_TEXT, reply_markup=MENU_KB)
 
 
+BG_TASKS = set()
+
+
+async def elon_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not await guard(u, update.message):
+        return
+    now_off = not store.is_optout(u.id)
+    store.set_optout(u.id, now_off)
+    await update.message.reply_text("🔕 E’lonlar o‘chirildi." if now_off else "🔔 E’lonlar yoqildi.")
+
+
+async def bc_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    u = update.effective_user
+    if not is_admin(u.id):
+        return  # oddiy foydalanuvchiga hech narsa bildirmaymiz
+    logging.info("ADMIN uid=%s cmd=/xabar", u.id)
+    ctx.user_data.clear()
+    ctx.user_data["step"] = "bc_wait"
+    n = len(await store.broadcast_ids())
+    await update.message.reply_text(
+        f"📢 E’lon: hozir {n} ta foydalanuvchiga yuboriladi.\n\n"
+        "E’lon xabarini yuboring (matn, rasm yoki video + izoh). Oxiriga «E’lonlarni o‘chirish: /elon» "
+        "qo‘shsangiz, odamlar bloklamaydi. Bekor qilish: /cancel")
+
+
+async def bc_capture(update, ctx):
+    """Admin e'lon matnini yuborganda: ko'rinishini tasdiqlashga qo'yadi."""
+    ud, u, m = ctx.user_data, update.effective_user, update.message
+    if ud.get("step") != "bc_wait" or not is_admin(u.id):
+        return False
+    ud["bc"] = (m.chat_id, m.message_id)
+    ud["step"] = "bc_confirm"
+    n = len(await store.broadcast_ids())
+    await m.reply_text(f"👆 Shu xabar {n} ta foydalanuvchiga yuboriladi. Tasdiqlaysizmi?",
+                       reply_markup=_kb([("✅ Yuborish", "bc:go"), ("❌ Bekor", "bc:no")]))
+    return True
+
+
+async def run_broadcast(bot, admin_id, chat_id, mid, ids):
+    ok = blocked = failed = 0
+    for i, uid in enumerate(ids, 1):
+        try:
+            try:
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=mid)
+            except RetryAfter as e:
+                ra = e.retry_after
+                await asyncio.sleep((ra.total_seconds() if hasattr(ra, "total_seconds") else float(ra)) + 1)
+                await bot.copy_message(chat_id=uid, from_chat_id=chat_id, message_id=mid)
+            ok += 1
+        except Forbidden:
+            store.mark_blocked(uid)
+            blocked += 1
+        except BadRequest as e:
+            if "chat not found" in str(e).lower():
+                store.mark_blocked(uid)
+                blocked += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+        await asyncio.sleep(0.05)  # soniyasiga ~20 ta: Telegram limitidan (30) past
+        if i % 200 == 0:
+            try:
+                await bot.send_message(admin_id, f"… {i}/{len(ids)} yuborildi")
+            except Exception:
+                pass
+    try:
+        await bot.send_message(admin_id, f"✅ E’lon tugadi.\nYuborildi: {ok}\nBotni bloklagan: {blocked}\nXato: {failed}")
+    except Exception:
+        pass
+
+
 async def stat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     if not is_admin(u.id):
         return  # oddiy foydalanuvchiga hech narsa bildirmaymiz
     logging.info("ADMIN uid=%s cmd=/stat", u.id)
-    await update.message.reply_text(store.stats_text())
+    await update.message.reply_text(await store.stats_text())
 
 
 async def on_error(update, ctx: ContextTypes.DEFAULT_TYPE):
     logging.error("Handler xatosi", exc_info=ctx.error)
     await notify_admin(ctx, f"⚠️ Bot xatosi: {type(ctx.error).__name__}: {ctx.error}")
+    m = getattr(update, "effective_message", None)
+    if m is not None:
+        try:
+            await m.reply_text("⚠️ Kutilmagan xato chiqdi. Bosh menyuga qaytish: /menu")
+        except Exception:
+            pass
 
 
 async def begin_obyektivka(msg, ctx):
@@ -470,8 +542,9 @@ async def show_profile(msg, uid):
     else:
         text = ("👤 Profilingiz hali bo‘sh. Birinchi hujjatni tayyorlaganingizda ism va universitet "
                 "avtomatik saqlanadi, yoki hozir o‘zingiz kiriting.")
+    opt = ("🔔 E’lonlarni yoqish", "prof:optin") if store.is_optout(uid) else ("🔕 E’lonlarni o‘chirish", "prof:optout")
     await msg.reply_text(text, reply_markup=_kb(
-        [("✏️ O‘zgartirish", "m:profedit"), ("🗑 O‘chirish", "prof:del")], [("🏠 Menyu", "m:menu")]))
+        [("✏️ O‘zgartirish", "m:profedit"), ("🗑 O‘chirish", "prof:del")], [opt], [("🏠 Menyu", "m:menu")]))
 
 
 async def begin_pdf(msg, ud):
@@ -484,15 +557,28 @@ async def begin_pdf(msg, ud):
               InlineKeyboardMarkup([[MENU_BTN]]))
 
 
+def _alive(ud, step, key):
+    """Yuklab olish davomida sessiya tugamaganini tekshiradi."""
+    return ud.get("step") == step and key in ud
+
+
 async def add_pdf_image(msg, ud, tg_file, group):
+    if not _alive(ud, "pdf", "pics"):
+        return
     first = group is None or ud.get("last_group") != group
     ud["last_group"] = group
     if len(ud["pics"]) >= MAX_PDF:
         if first:
             await msg.reply_text(f"Ko‘pi bilan {MAX_PDF} ta rasm. «PDF qilish» ni bosing.", reply_markup=PDF_KB)
         return
-    raw = await tg_file.download_as_bytearray()
-    data = images.shrink(bytes(raw))
+    ud["pending"] = ud.get("pending", 0) + 1
+    try:
+        raw = await tg_file.download_as_bytearray()
+        data = images.shrink(bytes(raw))
+    finally:
+        ud["pending"] = max(0, ud.get("pending", 1) - 1)
+    if not _alive(ud, "pdf", "pics"):
+        return  # PDF allaqachon tayyorlangan yoki sessiya tugagan
     if data is None:
         await msg.reply_text("Bu rasmni ochib bo‘lmadi (JPG yoki PNG yuboring).")
         return
@@ -531,17 +617,11 @@ def split_text(t, size=3800):
 
 
 def chat_left(uid):
-    if is_admin(uid):
-        return 999
-    day = datetime.date.today().isoformat()
-    d, n = CHAT_USAGE.get(uid, (day, 0))
-    return CHAT_LIMIT - (n if d == day else 0)
+    return 999 if is_admin(uid) else CHAT_LIMIT - store.used(uid, "chat")
 
 
 def chat_use(uid):
-    day = datetime.date.today().isoformat()
-    d, n = CHAT_USAGE.get(uid, (day, 0))
-    CHAT_USAGE[uid] = (day, (n if d == day else 0) + 1)
+    store.add_used(uid, "chat")
 
 
 async def begin_ai(msg, ud):
@@ -600,16 +680,23 @@ async def begin_zip(msg, ud):
 
 
 async def add_zip_file(msg, ud, tg_file, name, group):
+    if not _alive(ud, "zip", "files"):
+        return
     first = group is None or ud.get("last_group") != group
     ud["last_group"] = group
     if len(ud["files"]) >= MAX_ZIP_FILES or ud["size"] >= MAX_ZIP_BYTES:
         if first:
             await msg.reply_text("Limitga yetdi. «ZIP qilish» ni bosing.", reply_markup=ZIP_KB)
         return
+    ud["pending"] = ud.get("pending", 0) + 1
     try:
         raw = bytes(await tg_file.download_as_bytearray())
     except Exception:
         await msg.reply_text("Bu faylni yuklab bo‘lmadi (20 MB dan katta bo‘lishi mumkin).")
+        return
+    finally:
+        ud["pending"] = max(0, ud.get("pending", 1) - 1)
+    if not _alive(ud, "zip", "files"):
         return
     if ud["size"] + len(raw) > MAX_ZIP_BYTES:
         await msg.reply_text("Jami hajm 45 MB dan oshib ketadi, bu fayl qo‘shilmadi.", reply_markup=ZIP_KB)
@@ -629,6 +716,14 @@ async def add_zip_file(msg, ud, tg_file, name, group):
     await drop_kb(ud)
     await ask(msg, ud, "📎 Qabul qilindi. Yana yuboring yoki ZIP qiling "
                        "(bir nechta fayl yuborgan bo‘lsangiz, hammasi qo‘shiladi):", ZIP_KB)
+
+
+async def wait_uploads(ud):
+    """Albomning hamma rasmi yuklab bo'linishini (ko'pi bilan ~9 soniya) kutadi."""
+    for _ in range(30):
+        if not ud.get("pending"):
+            break
+        await asyncio.sleep(0.3)
 
 
 async def begin_contact(msg, ud):
@@ -841,6 +936,8 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not await guard(user, msg):
         return
+    if await bc_capture(update, ctx):
+        return
 
     # admin foydalanuvchi xabariga javob yozsa — foydalanuvchiga yuboriladi
     if is_admin(user.id) and msg.reply_to_message and msg.reply_to_message.text:
@@ -944,6 +1041,8 @@ async def on_photo(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await guard(update.effective_user, msg, "media"):
         return
+    if await bc_capture(update, ctx):
+        return
     if not ud.get("step"):  # menyuda turib rasm yuborsa — PDF rejimini o'zi boshlaymiz
         await begin_pdf(msg, ud)
     step = ud.get("step")
@@ -976,6 +1075,8 @@ async def on_doc(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = update.message
     if not await guard(update.effective_user, msg, "media"):
         return
+    if await bc_capture(update, ctx):
+        return
     doc = msg.document
     is_img = (doc.mime_type or "").startswith("image/")
     if not ud.get("step"):
@@ -999,7 +1100,11 @@ async def on_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Video/audio — faqat ZIP rejimida."""
     ud = ctx.user_data
     msg = update.message
-    if ud.get("step") != "zip" or not await guard(update.effective_user, msg, "media"):
+    if not await guard(update.effective_user, msg, "media"):
+        return
+    if await bc_capture(update, ctx):
+        return
+    if ud.get("step") != "zip":
         return
     m = msg.video or msg.audio
     name = getattr(m, "file_name", None) or f"{'video' if msg.video else 'audio'}_{msg.message_id}"
@@ -1026,6 +1131,27 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
         await msg.reply_text("Rahmat! 🙏" if val == "up" else
                              "Rahmat! Nima yoqmaganini «📞 Admin bilan bog‘lanish» orqali yozsangiz, tuzatamiz.")
+        return
+    if data in ("prof:optout", "prof:optin"):
+        store.set_optout(q.from_user.id, data == "prof:optout")
+        await msg.reply_text("🔕 E’lonlar o‘chirildi." if data == "prof:optout" else "🔔 E’lonlar yoqildi.",
+                             reply_markup=MENU_KB)
+        return
+    if data.startswith("bc:"):
+        if not is_admin(q.from_user.id):
+            return
+        if data == "bc:no":
+            ud.clear()
+            await msg.reply_text("Bekor qilindi.")
+        elif data == "bc:go" and ud.get("bc"):
+            chat_id, mid = ud["bc"]
+            ud.clear()
+            ids = await store.broadcast_ids()
+            logging.info("ADMIN uid=%s cmd=broadcast n=%s", q.from_user.id, len(ids))
+            await msg.reply_text(f"🚀 Yuborish boshlandi: {len(ids)} ta. Tugagach hisobot beraman.")
+            t = asyncio.get_running_loop().create_task(run_broadcast(ctx.bot, q.from_user.id, chat_id, mid, ids))
+            BG_TASKS.add(t)
+            t.add_done_callback(BG_TASKS.discard)
         return
     if data == "prof:del":
         store.clear_profile(q.from_user.id)
@@ -1111,7 +1237,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ud["files"], ud["size"], ud["last_group"] = [], 0, None
             await ask(msg, ud, "Tozalandi. Yangi fayllarni yuboring.", InlineKeyboardMarkup([[MENU_BTN]]))
         elif data == "zip:make":
-            if not ud["files"]:
+            await wait_uploads(ud)
+            if not ud.get("files"):
                 await msg.reply_text("Avval fayl yuboring.")
                 return
             ud["busy"] = True
@@ -1134,7 +1261,8 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ud["pics"], ud["last_group"] = [], None
             await ask(msg, ud, "Tozalandi. Yangi rasmlarni yuboring.", InlineKeyboardMarkup([[MENU_BTN]]))
         elif data == "pdf:make":
-            if not ud["pics"]:
+            await wait_uploads(ud)
+            if not ud.get("pics"):
                 await msg.reply_text("Avval rasm yuboring.")
                 return
             ud["busy"] = True
@@ -1205,6 +1333,8 @@ def main():
     app.add_handler(CommandHandler("profil", profil_cmd))
     app.add_handler(CommandHandler("yordam", help_cmd))
     app.add_handler(CommandHandler("stat", stat_cmd))
+    app.add_handler(CommandHandler("xabar", bc_start))
+    app.add_handler(CommandHandler("elon", elon_cmd))
     app.add_error_handler(on_error)
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("orqaga", back))
