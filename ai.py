@@ -30,8 +30,8 @@ async def _call(c, model, key, cfg, contents, system):
         if r.status_code == 400 and think:
             think = False
             continue
-        if r.status_code in (429, 500, 503):
-            await asyncio.sleep(4 * (attempt + 1))
+        if r.status_code in (429, 500, 503) and attempt < 2:
+            await asyncio.sleep(3 * (attempt + 1))  # vaqtinchalik band: biroz kutib qayta urinamiz
             continue
         break
     return r
@@ -39,6 +39,7 @@ async def _call(c, model, key, cfg, contents, system):
 
 async def generate(prompt: str, json_mode: bool = False, max_tokens: int = 8192, key=None, system=None,
                    history=None, sem=None) -> str:
+    """Modellar ketma-ket sinaladi: 404 (model yo'q), 429 (kvota), 500/503 (Google band) bo'lsa — keyingisi."""
     global _good
     import httpx  # python-telegram-bot bilan birga o'rnatiladi
 
@@ -50,18 +51,24 @@ async def generate(prompt: str, json_mode: bool = False, max_tokens: int = 8192,
         cfg["responseMimeType"] = "application/json"
     contents = [{"role": h["role"], "parts": [{"text": h["text"]}]} for h in (history or [])]
     contents.append({"role": "user", "parts": [{"text": prompt}]})
-    order = ([_good] if _good else []) + [m for m in MODELS if m != _good]
     r = None
     async with (sem or _sem):
         async with httpx.AsyncClient(timeout=240) as c:
-            for model in order:
-                r = await _call(c, model, key, cfg, contents, system)
-                if r.status_code == 404:  # model topilmadi -> keyingisi
-                    continue
-                if r.status_code == 200:
-                    _good = model
-                break
-    if r.status_code == 429:
+            for rnd in range(2):  # hamma model band bo'lsa, biroz kutib yana bir aylanish
+                order = ([_good] if _good else []) + [m for m in MODELS if m != _good]
+                for model in order:
+                    r = await _call(c, model, key, cfg, contents, system)
+                    if r.status_code == 200:
+                        _good = model
+                        break
+                    if r.status_code in (404, 429, 500, 503):
+                        continue  # keyingi modelga o'tamiz
+                    break  # boshqa xato (masalan 400/403) — modelni almashtirish yordam bermaydi
+                if r.status_code == 200 or r.status_code not in (404, 429, 500, 503):
+                    break
+                if rnd == 0:
+                    await asyncio.sleep(8)
+    if r.status_code in (429, 500, 503):
         raise AIError("busy")
     if r.status_code != 200:
         raise AIError(f"http {r.status_code}: {r.text[:300]}")
