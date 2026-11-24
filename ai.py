@@ -1,6 +1,7 @@
 """Gemini (Google AI Studio, bepul daraja) bilan ishlash."""
 import asyncio
 import json
+import logging
 import os
 import re
 
@@ -15,6 +16,19 @@ class AIError(Exception):
     pass
 
 
+class _NetErr:
+    """Tarmoq xatosi/timeout: 503 kabi qaraladi (qayta urinish + keyingi modelga o'tish)."""
+    status_code = 503
+    text = "network/timeout"
+
+
+def _net_errors():
+    import httpx
+
+    errs = tuple(getattr(httpx, n) for n in ("TimeoutException", "TransportError") if hasattr(httpx, n))
+    return errs or (OSError,)
+
+
 async def _call(c, model, key, cfg, contents, system):
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
     think = True
@@ -26,7 +40,11 @@ async def _call(c, model, key, cfg, contents, system):
         body = {"contents": contents, "generationConfig": gc}
         if system:
             body["systemInstruction"] = {"parts": [{"text": system}]}
-        r = await c.post(url, json=body, headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+        try:
+            r = await c.post(url, json=body, headers={"x-goog-api-key": key, "Content-Type": "application/json"})
+        except _net_errors() as e:
+            logging.warning("Gemini tarmoq xatosi (%s): %s", model, type(e).__name__)
+            r = _NetErr()
         if r.status_code == 400 and think:
             think = False
             continue
@@ -53,7 +71,9 @@ async def generate(prompt: str, json_mode: bool = False, max_tokens: int = 8192,
     contents.append({"role": "user", "parts": [{"text": prompt}]})
     r = None
     async with (sem or _sem):
-        async with httpx.AsyncClient(timeout=240) as c:
+        read = min(200, 45 + max_tokens / 100)  # katta javob uchun ko'proq, kichigi uchun kamroq kutamiz
+        tmo = httpx.Timeout(read, connect=10) if hasattr(httpx, "Timeout") else read
+        async with httpx.AsyncClient(timeout=tmo) as c:
             for rnd in range(2):  # hamma model band bo'lsa, biroz kutib yana bir aylanish
                 order = ([_good] if _good else []) + [m for m in MODELS if m != _good]
                 for model in order:
@@ -108,21 +128,23 @@ def parse_json(text: str):
 LANG_NAME = {"uz": "Uzbek (Latin script, correct modern orthography)", "ru": "Russian", "en": "English"}
 
 
-async def make_slides(topic, subject, lang, k):
-    prompt = f"""You are an experienced university professor preparing a presentation that must impress teachers and classmates.
+def _slide_prompt(topic, subject, lang, k, role):
+    return f"""You are an experienced university professor preparing a presentation that must impress teachers and classmates.
 Language of ALL text: {LANG_NAME[lang]}
 Subject: {subject}
 Topic: {topic}
-Create exactly {k} content slides (NO title slide, NO agenda slide, NO thank-you slide: they are added automatically). The LAST slide must be the conclusion.
+Create exactly {k} content slides (NO title slide, NO agenda slide, NO thank-you slide: they are added automatically). {role}
 Rules:
 - Slide title: at most 7 words.
 - 4 or 5 bullets per slide; each bullet is ONE complete, informative sentence of 10-18 words with concrete content (terms, dates, names, causes, examples). Use only well-established facts; never invent statistics, quotes or sources.
 - key_point: one memorable takeaway sentence, at most 14 words.
 - image_query: for about half of the slides give 2-4 ENGLISH words naming something concrete and photographable that fits the slide (e.g. "Registan Samarkand", "solar panels field"); otherwise an empty string. Never ask for images of real private persons. Conclusion slide: empty.
 - notes: 2-3 sentences the presenter can say aloud for this slide.
-- Logical flow: background, main parts, examples/significance, conclusion. Do not repeat content between slides.
+- Do not repeat content between slides.
 Return ONLY JSON: {{"slides":[{{"title":"","bullets":[""],"key_point":"","image_query":"","notes":""}}]}}"""
-    text = await generate(prompt, json_mode=True, max_tokens=24000)
+
+
+def _parse_slides(text):
     data = parse_json(text)
     slides = []
     for s in data["slides"]:
@@ -139,6 +161,26 @@ Return ONLY JSON: {{"slides":[{{"title":"","bullets":[""],"key_point":"","image_
     if not slides:
         raise AIError("empty")
     return slides
+
+
+async def make_slides(topic, subject, lang, k):
+    """10 va undan ko'p slayd ikki qismga bo'linib parallel yoziladi (tezroq, timeout xavfi kam)."""
+    if k < 10:
+        text = await generate(_slide_prompt(topic, subject, lang, k, "The LAST slide must be the conclusion."),
+                              json_mode=True, max_tokens=min(16000, 1500 + k * 900))
+        return _parse_slides(text)
+    k1 = k // 2
+    k2 = k - k1
+    p1 = _slide_prompt(topic, subject, lang, k1,
+                       "This is PART 1 of 2: cover the background, key concepts and main components. "
+                       "Do NOT write a conclusion.")
+    p2 = _slide_prompt(topic, subject, lang, k2,
+                       "This is PART 2 of 2: cover applications, examples, problems, significance and future "
+                       "outlook; do not repeat basic definitions. The LAST slide must be the conclusion.")
+    t1, t2 = await asyncio.gather(
+        generate(p1, json_mode=True, max_tokens=min(16000, 1500 + k1 * 900)),
+        generate(p2, json_mode=True, max_tokens=min(16000, 1500 + k2 * 900)))
+    return _parse_slides(t1) + _parse_slides(t2)
 
 
 TITLES = {

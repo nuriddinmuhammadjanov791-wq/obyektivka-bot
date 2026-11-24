@@ -292,6 +292,14 @@ def unlimited(uid):
     return is_admin(uid) or store.is_vip(uid)
 
 
+def where(e):
+    """Xato qaysi fayl va qatorda bo'lganini qisqa ko'rsatadi."""
+    tb = e.__traceback__
+    while tb and tb.tb_next:
+        tb = tb.tb_next
+    return f"{os.path.basename(tb.tb_frame.f_code.co_filename)}:{tb.tb_lineno}" if tb else "?"
+
+
 def quota_left(uid):
     return 999 if unlimited(uid) else DAILY_LIMIT - store.used(uid, "doc")
 
@@ -308,7 +316,7 @@ THANKS = (
     "Botdan foydalanganingiz uchun rahmat! 🙏\n\n"
     "Rahmatni ikki xil aytsangiz bo‘ladi 😁\n"
     "💳 <code>5614688708547111</code> N.M orqali 😅\n"
-    "✍️ yoki @ozodbekraximjonov ga samimiy yozib qo‘yish orqali 😊"
+    "✍️ yoki @nuriddin26 ga samimiy yozib qo‘yish orqali 😊"
 )
 
 BTN_DONE_WORK = InlineKeyboardMarkup([[InlineKeyboardButton("✅ Tayyor", callback_data="work_done")]])
@@ -791,7 +799,11 @@ async def build_output(form, d, uid):
     if form == "slayd":
         n = int(d["count"])
         slides = await ai.make_slides(d["topic"], d["subject"], d["lang"], n - 3)
-        pics = await images.fetch_all([x.get("image_query", "") for x in slides], IMG_RATIO)
+        try:
+            pics = await asyncio.wait_for(
+                images.fetch_all([x.get("image_query", "") for x in slides], IMG_RATIO), timeout=70)
+        except Exception:  # rasmlar topilmasa, slayd rasmsiz tayyorlanadi
+            pics = [None] * len(slides)
         for x, p in zip(slides, pics):
             x["img"] = p
         out = os.path.join(tmp, f"slayd_{uid}.pptx")
@@ -891,7 +903,7 @@ async def finish_form(msg, ctx, ud, user):
         await msg.reply_text(txt, reply_markup=RETRY_KB)
     except Exception as e:
         logging.exception("Generatsiya xatosi")
-        await notify_admin(ctx, f"⚠️ {form} kutilmagan xato (user {uid}): {type(e).__name__}: {e}")
+        await notify_admin(ctx, f"⚠️ {form} kutilmagan xato (user {uid}): {type(e).__name__}: {e} [{where(e)}]")
         await msg.reply_text(ERR_TECH, reply_markup=RETRY_KB)
     ud.clear()
 
